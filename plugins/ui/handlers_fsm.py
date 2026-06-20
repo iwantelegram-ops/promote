@@ -78,6 +78,12 @@ async def handle_fsm_input(client, message: Message):
         await _handle_wl_input(client, message, user_id, wl_state)
         return
 
+    # ── NewsCore FSM ──────────────────────────────────────────────────────────
+    from plugins.ui.handlers_dm import _ns_fsm
+    if user_id in _ns_fsm:
+        await _handle_ns_fsm_input(client, message, user_id)
+        return
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Handler regex FSM
@@ -322,3 +328,150 @@ async def cancel_fsm(client, message: Message):
         await message.delete()
     except Exception:
         pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  NewsCore FSM Handler
+# ─────────────────────────────────────────────────────────────────────────────
+async def _handle_ns_fsm_input(client, message: Message, user_id: int):
+    """
+    2-langkah input untuk mode day/date:
+      step 1 (ns_step1_day)  → ketik N hari  (angka bebas ≥ 1)
+      step 1 (ns_step1_date) → ketik tanggal  (1–30)
+      step 2 (ns_input_time) → ketik HH:MM   (berlaku semua mode)
+    Weekday langsung masuk step 2 setelah pilih hari via tombol.
+
+    Perilaku:
+      - Pesan user langsung dihapus (tampilan bersih)
+      - Antar step: edit pesan bot in-place (bukan reply baru)
+      - Selesai: edit pesan bot → konfirmasi, lalu otomatis ke ns_panel
+    """
+    from plugins.ui.handlers_dm import _ns_fsm
+    from database import ns_update, ns_get_config, ns_calc_next_reset
+    from datetime import datetime
+
+    state   = _ns_fsm[user_id]
+    chat_id = state["chat_id"]
+    action  = state["action"]
+    msg_id  = state.get("msg_id")   # ID pesan bot yang akan di-edit
+    text    = message.text.strip()
+
+    # Hapus pesan user segera agar chat tetap bersih
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    try:
+        # ── LANGKAH 1A: input N hari ─────────────────────────────────────────
+        if action == "ns_step1_day":
+            if not text.isdigit() or int(text) < 1:
+                # Edit pesan bot dengan pesan error + prompt ulang
+                await _safe_edit_id(
+                    client, message.chat.id, msg_id,
+                    "📆 <b>LANGKAH 1/2 — Jumlah Hari</b>\n\n"
+                    "❌ Harus angka bulat positif (minimal 1).\n"
+                    "Contoh: <code>7</code>  (reset setiap 7 hari)\n\n"
+                    "<i>Angka bebas, minimal 1.</i>",
+                    InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Batal", callback_data=f"ns_panel_{chat_id}")]]),
+                )
+                return
+
+            val1 = int(text)
+            await ns_update(chat_id, {"reset_days": val1})
+            _ns_fsm[user_id] = {"chat_id": chat_id, "action": "ns_input_time", "step": 2, "val1": val1, "msg_id": msg_id}
+            await _safe_edit_id(
+                client, message.chat.id, msg_id,
+                f"⏰ <b>LANGKAH 2/2 — Jam Reset</b>\n\n"
+                f"✅ Jumlah hari: <code>{val1}</code>\n\n"
+                "Ketik jam dan menit dalam format <code>HH:MM</code>.\n"
+                "Contoh: <code>23:59</code>",
+                InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Batal", callback_data=f"ns_panel_{chat_id}")]]),
+            )
+            return
+
+        # ── LANGKAH 1B: input tanggal ────────────────────────────────────────
+        elif action == "ns_step1_date":
+            if not text.isdigit() or not (1 <= int(text) <= 30):
+                await _safe_edit_id(
+                    client, message.chat.id, msg_id,
+                    "📅 <b>LANGKAH 1/2 — Tanggal Reset</b>\n\n"
+                    "❌ Tanggal harus angka 1 — 30.\n"
+                    "Contoh: <code>1</code>  (reset setiap tgl 1)\n\n"
+                    "<i>Harus angka 1 — 30.</i>",
+                    InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Batal", callback_data=f"ns_panel_{chat_id}")]]),
+                )
+                return
+
+            val1 = int(text)
+            await ns_update(chat_id, {"reset_date": val1})
+            _ns_fsm[user_id] = {"chat_id": chat_id, "action": "ns_input_time", "step": 2, "val1": val1, "msg_id": msg_id}
+            await _safe_edit_id(
+                client, message.chat.id, msg_id,
+                f"⏰ <b>LANGKAH 2/2 — Jam Reset</b>\n\n"
+                f"✅ Tanggal reset: <code>{val1}</code>\n\n"
+                "Ketik jam dan menit dalam format <code>HH:MM</code>.\n"
+                "Contoh: <code>23:59</code>",
+                InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Batal", callback_data=f"ns_panel_{chat_id}")]]),
+            )
+            return
+
+        # ── LANGKAH 2: input HH:MM ────────────────────────────────────────────
+        elif action == "ns_input_time":
+            parts = text.split(":")
+            if len(parts) != 2 or not all(p.isdigit() for p in parts):
+                await _safe_edit_id(
+                    client, message.chat.id, msg_id,
+                    "⏰ <b>Ketik jam reset NewsCore:</b>\n\n"
+                    "❌ Format salah. Harus <code>HH:MM</code>.\n"
+                    "Contoh: <code>23:59</code>",
+                    InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Batal", callback_data=f"ns_panel_{chat_id}")]]),
+                )
+                return
+
+            hour, minute = int(parts[0]), int(parts[1])
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                await _safe_edit_id(
+                    client, message.chat.id, msg_id,
+                    "⏰ <b>Ketik jam reset NewsCore:</b>\n\n"
+                    "❌ Jam harus 0–23, menit harus 0–59.\n"
+                    "Contoh: <code>23:59</code>",
+                    InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Batal", callback_data=f"ns_panel_{chat_id}")]]),
+                )
+                return
+
+            await ns_update(chat_id, {"reset_hour": hour, "reset_minute": minute})
+
+        else:
+            _ns_fsm.pop(user_id, None)
+            return
+
+        # ── Selesai: hitung next_reset, tampilkan konfirmasi sebentar, lalu kembali ke panel ──
+        _ns_fsm.pop(user_id, None)
+        cfg      = await ns_get_config(chat_id)
+        new_next = ns_calc_next_reset(cfg)
+        await ns_update(chat_id, {"next_reset": new_next})
+
+        # Tampilkan konfirmasi singkat di pesan bot
+        await _safe_edit_id(
+            client, message.chat.id, msg_id,
+            "✅ <b>Konfigurasi NewsCore disimpan!</b>\n\n"
+            f"📅 Reset berikutnya: <code>{datetime.fromisoformat(new_next).strftime('%d %b %Y %H:%M')}</code> WIB\n\n"
+            "<i>Kembali ke panel…</i>",
+        )
+
+        # Jeda singkat lalu otomatis kembali ke sub-menu NewsCore
+        await asyncio.sleep(1.5)
+        from plugins.ui.pages import page_newscore
+        text_panel, keyboard_panel = await page_newscore(chat_id)
+        await _safe_edit_id(client, message.chat.id, msg_id, text_panel, keyboard_panel)
+
+    except ValueError:
+        _ns_fsm.pop(user_id, None)
+        await _safe_edit_id(
+            client, message.chat.id, msg_id,
+            "❌ Input tidak valid, pastikan angka semua.",
+        )
+    except Exception as e:
+        _ns_fsm.pop(user_id, None)
+        print(f"[ns_fsm_input] {e}")

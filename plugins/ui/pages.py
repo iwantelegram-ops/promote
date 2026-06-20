@@ -429,6 +429,13 @@ async def page_manage(chat_id: int):
     ub_ready   = is_userbot_ready()
     ub_hint    = "" if ub_ready else " ⚠️"
 
+    # Ambil status NewsCore
+    from database import ns_get_config as _ns_cfg
+    ns_cfg  = await _ns_cfg(chat_id)
+    ns_on   = ns_cfg.get("enabled", False)
+    ns_flag = "🟢 ON" if ns_on else "🔴 OFF"
+    ns_icon = "✅" if ns_on else "❌"
+
     text = (
         f"⚙️ <b>CONTROL PANEL</b>\n"
         f"<code>Grup: {chat_id}</code>\n"
@@ -449,6 +456,8 @@ async def page_manage(chat_id: int):
         f"<i>   10 spam berturut-turut → mute otomatis (berlipat).</i>\n\n"
         f"{sec_icon} <b>Security OS</b>  —  <code>{sec_flag}</code>{ub_hint}\n"
         f"<i>   Mute mic user non-member &amp; bio-link di obrolan suara via userbot.</i>\n\n"
+        f"{ns_icon} <b>NewsCore</b>  —  <code>{ns_flag}</code>\n"
+        f"<i>   Angkat admin otomatis dari member teraktif secara berkala.</i>\n\n"
         f"<i>Tap tombol di bawah untuk ubah pengaturan secara instan.</i>"
     )
     keyboard = InlineKeyboardMarkup([
@@ -472,6 +481,9 @@ async def page_manage(chat_id: int):
         ],
         [
             InlineKeyboardButton(f"🔐 Security OS: {sec_flag}", callback_data=f"secos_panel_{chat_id}"),
+        ],
+        [
+            InlineKeyboardButton(f"🏆 NewsCore: {ns_flag}", callback_data=f"ns_panel_{chat_id}"),
         ],
         [InlineKeyboardButton("🔙  Daftar Grup", callback_data="admin_menu")],
     ])
@@ -880,3 +892,106 @@ async def page_security_os(chat_id: int, client=None):
 
     keyboard = InlineKeyboardMarkup(buttons)
     return text, keyboard
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Halaman — NewsCore Panel
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def page_newscore(chat_id: int):
+    from database import ns_get_config, HARI_MAP_NS
+    from datetime import datetime
+
+    cfg     = await ns_get_config(chat_id)
+    enabled = cfg.get("enabled", False)
+
+    def flag(v): return "🟢 ON" if v else "🔴 OFF"
+    def icon(v): return "✅" if v else "❌"
+
+    mode = cfg.get("mode", "day")
+    if mode == "day":
+        mode_text = f"Setiap <code>{cfg.get('reset_days', 7)}</code> hari"
+    elif mode == "date":
+        mode_text = f"Setiap tanggal <code>{cfg.get('reset_date', 1)}</code>"
+    else:
+        mode_text = f"Setiap hari <code>{HARI_MAP_NS.get(cfg.get('reset_weekday', 0))}</code>"
+
+    reset_time = f"{cfg.get('reset_hour', 23):02d}:{cfg.get('reset_minute', 59):02d} WIB"
+
+    next_r   = cfg.get("next_reset")
+    next_str = ""
+    if next_r and enabled:
+        try:
+            next_str = f"\n📅 <b>Reset Berikutnya:</b>  <code>{datetime.fromisoformat(next_r).strftime('%d %b %Y %H:%M')}</code> WIB"
+        except Exception:
+            pass
+
+    privs = cfg.get("privileges", {})
+    PLABELS = {
+        "can_delete_messages":    "Hapus Pesan",
+        "can_restrict_members":   "Mute / Kick",
+        "can_invite_users":       "Undang Member",
+        "can_pin_messages":       "Pin Pesan",
+        "can_manage_video_chats": "Kelola Video Chat",
+    }
+    priv_lines = "\n".join(
+        f"   {'✅' if privs.get(k, False) else '❌'} {label}"
+        for k, label in PLABELS.items()
+    )
+
+    text = (
+        f"🏆 <b>NEWSCORE — Skor Keaktifan & Admin Otomatis</b>\n"
+        f"<code>Grup: {chat_id}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{icon(enabled)} <b>Status NewsCore:</b>  <code>{flag(enabled)}</code>\n\n"
+        f"⚙️ <b>Konfigurasi Reset:</b>\n"
+        f"   📆 Mode: <code>{mode.upper()}</code>  ({mode_text})\n"
+        f"   ⏰ Jam Reset: <code>{reset_time}</code>\n"
+        f"   👑 Kuota Admin: <code>Top {cfg.get('max_admins', 1)}</code> teratas\n"
+        f"{next_str}\n\n"
+        f"🛡️ <b>Hak Akses Admin Baru:</b>\n{priv_lines}\n\n"
+        f"<i>Ketik /ns_score di grup untuk lihat leaderboard.</i>"
+    )
+
+    keyboard_rows = [
+        [InlineKeyboardButton(
+            f"{'🔴 Matikan' if enabled else '🟢 Aktifkan'} NewsCore",
+            callback_data=f"ns_toggle_{chat_id}"
+        )],
+        [
+            InlineKeyboardButton("⚙️ Mode Reset",    callback_data=f"ns_mode_{chat_id}"),
+            InlineKeyboardButton("👑 Kuota Admin",   callback_data=f"ns_maxadmin_{chat_id}"),
+        ],
+        [InlineKeyboardButton("⏰ Jam Reset",        callback_data=f"ns_time_{chat_id}")],
+        [InlineKeyboardButton("🛡️ Hak Admin Baru",  callback_data=f"ns_privs_{chat_id}")],
+        [InlineKeyboardButton("🔙  Kembali ke Panel", callback_data=f"manage_{chat_id}")],
+    ]
+    return text, InlineKeyboardMarkup(keyboard_rows)
+
+
+async def page_newscore_privs(chat_id: int):
+    from database import ns_get_config
+    cfg   = await ns_get_config(chat_id)
+    privs = cfg.get("privileges", {})
+    PLABELS = {
+        "can_delete_messages":    "Hapus Pesan",
+        "can_restrict_members":   "Mute / Kick",
+        "can_invite_users":       "Undang Member",
+        "can_pin_messages":       "Pin Pesan",
+        "can_manage_video_chats": "Kelola Video Chat",
+    }
+    buttons = [
+        [InlineKeyboardButton(
+            f"{'🟢' if privs.get(k, False) else '🔴'}  {label}",
+            callback_data=f"ns_priv_{k}_{chat_id}"
+        )]
+        for k, label in PLABELS.items()
+    ]
+    buttons.append([InlineKeyboardButton("🔙  Kembali", callback_data=f"ns_panel_{chat_id}")])
+    text = (
+        f"🛡️ <b>HAK AKSES ADMIN BARU — NewsCore</b>\n"
+        f"<code>Grup: {chat_id}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Tap tombol untuk toggle ON/OFF hak akses admin yang akan diangkat otomatis."
+    )
+    return text, InlineKeyboardMarkup(buttons)

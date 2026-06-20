@@ -30,6 +30,7 @@ from plugins.ui.pages import (
     page_regex_tutorial, page_regex_list,
     page_whitelist_text, page_free_list,
     page_cas_panel,
+    page_newscore, page_newscore_privs,
 )
 from plugins.ui.fsm_state import (
     pending_regex_state, pending_free_state, pending_wl_state,
@@ -543,3 +544,231 @@ async def cb_free_del(client, cb: CallbackQuery):
             await cb.answer("❌ Gagal menghapus user VIP.", show_alert=True)
         except Exception:
             pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NEWSCORE CALLBACKS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── FSM state untuk input teks NewsCore ──────────────────────────────────────
+_ns_fsm: dict = {}  # user_id → {"chat_id": int, "action": str, "step": int, "val1": int}
+
+
+@Client.on_callback_query(filters.regex(r"^ns_panel_(-?\d+)$"))
+async def cb_ns_panel(client, cb: CallbackQuery):
+    await cb.answer()
+    try:
+        chat_id = int(re.match(r"^ns_panel_(-?\d+)$", cb.data).group(1))
+        if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
+            return await _deny_session(cb)
+        text, keyboard = await page_newscore(chat_id)
+        await safe_edit(cb.message, text, keyboard)
+    except Exception as e:
+        print(f"[cb_ns_panel] {e}")
+
+
+@Client.on_callback_query(filters.regex(r"^ns_toggle_(-?\d+)$"))
+async def cb_ns_toggle(client, cb: CallbackQuery):
+    await cb.answer()
+    try:
+        chat_id = int(re.match(r"^ns_toggle_(-?\d+)$", cb.data).group(1))
+        if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
+            return await _deny_session(cb)
+
+        from database import ns_get_config, ns_update, ns_calc_next_reset
+        cfg     = await ns_get_config(chat_id)
+        new_val = not cfg.get("enabled", False)
+        updates = {"enabled": new_val}
+        if new_val and not cfg.get("next_reset"):
+            updates["next_reset"] = ns_calc_next_reset(cfg)
+        await ns_update(chat_id, updates)
+        await cb.answer("✅ NewsCore " + ("diaktifkan!" if new_val else "dimatikan!"), show_alert=False)
+        text, keyboard = await page_newscore(chat_id)
+        await safe_edit(cb.message, text, keyboard)
+    except Exception as e:
+        print(f"[cb_ns_toggle] {e}")
+
+
+@Client.on_callback_query(filters.regex(r"^ns_mode_(-?\d+)$"))
+async def cb_ns_mode(client, cb: CallbackQuery):
+    await cb.answer()
+    try:
+        chat_id = int(re.match(r"^ns_mode_(-?\d+)$", cb.data).group(1))
+        if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
+            return await _deny_session(cb)
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📆 Per N Hari",         callback_data=f"ns_setmode_day_{chat_id}")],
+            [InlineKeyboardButton("📅 Per Tanggal Bulanan", callback_data=f"ns_setmode_date_{chat_id}")],
+            [InlineKeyboardButton("📆 Per Hari Minggu",    callback_data=f"ns_setmode_weekday_{chat_id}")],
+            [InlineKeyboardButton("🔙  Kembali",           callback_data=f"ns_panel_{chat_id}")],
+        ])
+        await safe_edit(cb.message, "⚙️ <b>Pilih Mode Penjadwalan Reset NewsCore:</b>", keyboard)
+    except Exception as e:
+        print(f"[cb_ns_mode] {e}")
+
+
+@Client.on_callback_query(filters.regex(r"^ns_setmode_(day|date|weekday)_(-?\d+)$"))
+async def cb_ns_setmode(client, cb: CallbackQuery):
+    await cb.answer()
+    try:
+        m       = re.match(r"^ns_setmode_(day|date|weekday)_(-?\d+)$", cb.data)
+        mode    = m.group(1)
+        chat_id = int(m.group(2))
+        if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
+            return await _deny_session(cb)
+
+        from database import ns_update
+        await ns_update(chat_id, {"mode": mode})
+
+        uid = cb.from_user.id
+
+        if mode == "weekday":
+            from database import HARI_MAP_NS
+            btns = [
+                [InlineKeyboardButton(nama, callback_data=f"ns_setwday_{idx}_{chat_id}")]
+                for idx, nama in HARI_MAP_NS.items()
+            ]
+            btns.append([InlineKeyboardButton("🔙  Kembali", callback_data=f"ns_mode_{chat_id}")])
+            await safe_edit(cb.message, "📆 <b>Pilih hari reset tiap minggu:</b>", InlineKeyboardMarkup(btns))
+
+        elif mode == "day":
+            await safe_edit(
+                cb.message,
+                "📆 <b>LANGKAH 1/2 — Jumlah Hari</b>\n\n"
+                "Ketik berapa hari sekali reset dilakukan.\n"
+                "Contoh: <code>7</code>  (reset setiap 7 hari)\n\n"
+                "<i>Angka bebas, minimal 1.</i>",
+                InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Batal", callback_data=f"ns_panel_{chat_id}")]]),
+            )
+            _ns_fsm[uid] = {"chat_id": chat_id, "action": "ns_step1_day", "step": 1, "msg_id": cb.message.id}
+
+        else:  # date
+            await safe_edit(
+                cb.message,
+                "📅 <b>LANGKAH 1/2 — Tanggal Reset</b>\n\n"
+                "Ketik tanggal reset setiap bulan.\n"
+                "Contoh: <code>1</code>  (reset setiap tgl 1)\n\n"
+                "<i>Harus angka 1 — 30.</i>",
+                InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Batal", callback_data=f"ns_panel_{chat_id}")]]),
+            )
+            _ns_fsm[uid] = {"chat_id": chat_id, "action": "ns_step1_date", "step": 1, "msg_id": cb.message.id}
+    except Exception as e:
+        print(f"[cb_ns_setmode] {e}")
+
+
+@Client.on_callback_query(filters.regex(r"^ns_setwday_(\d+)_(-?\d+)$"))
+async def cb_ns_setwday(client, cb: CallbackQuery):
+    await cb.answer()
+    try:
+        m       = re.match(r"^ns_setwday_(\d+)_(-?\d+)$", cb.data)
+        wday    = int(m.group(1))
+        chat_id = int(m.group(2))
+        if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
+            return await _deny_session(cb)
+
+        from database import ns_update, HARI_MAP_NS
+        await ns_update(chat_id, {"reset_weekday": wday})
+
+        nama = HARI_MAP_NS.get(wday, str(wday))
+        await safe_edit(
+            cb.message,
+            f"⏰ <b>LANGKAH 1/1 — Jam Reset  (setiap {nama})</b>\n\n"
+            "Ketik jam dan menit dalam format <code>HH:MM</code>.\n"
+            "Contoh: <code>23:59</code>",
+            InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Batal", callback_data=f"ns_panel_{chat_id}")]]),
+        )
+        _ns_fsm[cb.from_user.id] = {"chat_id": chat_id, "action": "ns_input_time", "step": 2, "msg_id": cb.message.id}
+    except Exception as e:
+        print(f"[cb_ns_setwday] {e}")
+
+
+@Client.on_callback_query(filters.regex(r"^ns_maxadmin_(-?\d+)$"))
+async def cb_ns_maxadmin(client, cb: CallbackQuery):
+    await cb.answer()
+    try:
+        chat_id = int(re.match(r"^ns_maxadmin_(-?\d+)$", cb.data).group(1))
+        if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
+            return await _deny_session(cb)
+        btns = [
+            [InlineKeyboardButton(f"{i} Admin", callback_data=f"ns_setmax_{i}_{chat_id}")]
+            for i in [1, 2, 3]
+        ]
+        btns.append([InlineKeyboardButton("🔙  Kembali", callback_data=f"ns_panel_{chat_id}")])
+        await safe_edit(cb.message, "👑 <b>Jumlah admin diangkat per periode:</b>", InlineKeyboardMarkup(btns))
+    except Exception as e:
+        print(f"[cb_ns_maxadmin] {e}")
+
+
+@Client.on_callback_query(filters.regex(r"^ns_setmax_(\d+)_(-?\d+)$"))
+async def cb_ns_setmax(client, cb: CallbackQuery):
+    await cb.answer()
+    try:
+        m       = re.match(r"^ns_setmax_(\d+)_(-?\d+)$", cb.data)
+        n       = int(m.group(1))
+        chat_id = int(m.group(2))
+        if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
+            return await _deny_session(cb)
+        from database import ns_update
+        await ns_update(chat_id, {"max_admins": n})
+        await cb.answer(f"✅ Kuota admin diset ke {n}", show_alert=False)
+        text, keyboard = await page_newscore(chat_id)
+        await safe_edit(cb.message, text, keyboard)
+    except Exception as e:
+        print(f"[cb_ns_setmax] {e}")
+
+
+@Client.on_callback_query(filters.regex(r"^ns_time_(-?\d+)$"))
+async def cb_ns_time(client, cb: CallbackQuery):
+    """Ubah jam reset saja (tanpa ubah mode/nilai)."""
+    await cb.answer()
+    try:
+        chat_id = int(re.match(r"^ns_time_(-?\d+)$", cb.data).group(1))
+        if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
+            return await _deny_session(cb)
+        await safe_edit(
+            cb.message,
+            "⏰ <b>Ketik jam reset NewsCore:</b>\n\n"
+            "Format: <code>HH:MM</code>\n"
+            "Contoh: <code>23:59</code>",
+            InlineKeyboardMarkup([[InlineKeyboardButton("🚫 Batal", callback_data=f"ns_panel_{chat_id}")]]),
+        )
+        _ns_fsm[cb.from_user.id] = {"chat_id": chat_id, "action": "ns_input_time", "step": 2, "msg_id": cb.message.id}
+    except Exception as e:
+        print(f"[cb_ns_time] {e}")
+
+
+@Client.on_callback_query(filters.regex(r"^ns_privs_(-?\d+)$"))
+async def cb_ns_privs(client, cb: CallbackQuery):
+    await cb.answer()
+    try:
+        chat_id = int(re.match(r"^ns_privs_(-?\d+)$", cb.data).group(1))
+        if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
+            return await _deny_session(cb)
+        text, keyboard = await page_newscore_privs(chat_id)
+        await safe_edit(cb.message, text, keyboard)
+    except Exception as e:
+        print(f"[cb_ns_privs] {e}")
+
+
+@Client.on_callback_query(filters.regex(r"^ns_priv_"))
+async def cb_ns_priv_toggle(client, cb: CallbackQuery):
+    await cb.answer()
+    try:
+        raw     = cb.data[len("ns_priv_"):]
+        parts   = raw.rsplit("_", 1)
+        chat_id = int(parts[-1]) if parts[-1].lstrip("-").isdigit() else None
+        priv_key = parts[0]
+        if not chat_id:
+            return
+        if not await _adm_sess.verify_admin_session(client, cb.from_user.id, chat_id):
+            return await _deny_session(cb)
+
+        from database import ns_get_config, ns_update
+        cfg   = await ns_get_config(chat_id)
+        privs = dict(cfg.get("privileges", {}))
+        privs[priv_key] = not privs.get(priv_key, True)
+        await ns_update(chat_id, {"privileges": privs})
+        text, keyboard = await page_newscore_privs(chat_id)
+        await safe_edit(cb.message, text, keyboard)
+    except Exception as e:
+        print(f"[cb_ns_priv_toggle] {e}")
