@@ -88,9 +88,9 @@ from pyrogram.types import Message
 
 from database import db
 
-# ── Cooldown anti-spam: 1 menit per (chat_id, user_id) — lapis 3 ──────────
+# ── Cooldown anti-spam: 5 menit per (chat_id, user_id) — lapis 3 ──────────
 _unmutemic_cooldown: dict[tuple[int, int], float] = {}
-_COOLDOWN_SECS = 60   # 1 menit
+_COOLDOWN_SECS = 300   # 5 menit
 
 # ── Cooldown join-VC: per grup — lapis 1 (memblokir SEMUA user di grup) ───
 # Window ini menunggu data bio hasil scan join-VC terakhir "matang" sesuai
