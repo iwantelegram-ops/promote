@@ -1946,3 +1946,139 @@ async def get_group_action_log_page(
     except Exception as e:
         print(f"[DB] get_group_action_log_page error: {e}")
         return [], 0
+
+
+# ── NewsCore (Sistem Skor Keaktifan & Admin Otomatis) ──────────────────────────
+newscore_stats_db  = db["newscore_stats"]   # skor chat per user per grup
+newscore_admin_db  = db["newscore_admins"]  # riwayat admin aktif yang diangkat
+newscore_cfg_db    = db["newscore_config"]  # konfigurasi newscore per grup
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NEWSCORE — Sistem Skor Keaktifan & Admin Otomatis
+# ══════════════════════════════════════════════════════════════════════════════
+
+from datetime import datetime, timedelta as _timedelta
+
+NEWSCORE_DEFAULT = {
+    "enabled":        False,
+    "mode":           "day",      # "day" | "date" | "weekday"
+    "reset_days":     7,
+    "reset_date":     1,
+    "reset_weekday":  0,
+    "reset_hour":     23,
+    "reset_minute":   59,
+    "max_admins":     1,
+    "next_reset":     None,
+    "privileges": {
+        "can_delete_messages":   True,
+        "can_restrict_members":  True,
+        "can_invite_users":      True,
+        "can_pin_messages":      True,
+        "can_manage_video_chats": False,
+    },
+}
+
+HARI_MAP_NS = {0: "Senin", 1: "Selasa", 2: "Rabu", 3: "Kamis",
+               4: "Jumat", 5: "Sabtu", 6: "Minggu"}
+
+
+async def ns_get_config(chat_id: int) -> dict:
+    doc = await newscore_cfg_db.find_one({"chat_id": chat_id})
+    cfg = {k: v for k, v in NEWSCORE_DEFAULT.items()}
+    cfg["privileges"] = dict(NEWSCORE_DEFAULT["privileges"])
+    if doc:
+        for k in NEWSCORE_DEFAULT:
+            if k in doc:
+                cfg[k] = doc[k]
+        if "privileges" in doc:
+            cfg["privileges"] = dict(doc["privileges"])
+    return cfg
+
+
+async def ns_update(chat_id: int, updates: dict) -> None:
+    await newscore_cfg_db.update_one(
+        {"chat_id": chat_id},
+        {"$set": {"chat_id": chat_id, **updates}},
+        upsert=True,
+    )
+
+
+def ns_calc_next_reset(cfg: dict) -> str:
+    # Pakai TZ_WIB eksplisit (bukan datetime.now() naive) agar next_reset
+    # tidak meleset jika server hosting berjalan di timezone selain WIB
+    # (mis. UTC default di Railway/Docker). Tanpa ini, jam yang dimasukkan
+    # owner di UI (dimaksudkan WIB) bisa dieksekusi di jam yang berbeda.
+    now   = datetime.now(TZ_WIB)
+    h, m  = cfg.get("reset_hour", 23), cfg.get("reset_minute", 59)
+    mode  = cfg.get("mode", "day")
+    try:
+        if mode == "day":
+            days   = cfg.get("reset_days", 7)
+            target = (now + _timedelta(days=days)).replace(hour=h, minute=m, second=0, microsecond=0)
+        elif mode == "date":
+            d = cfg.get("reset_date", 1)
+            try:
+                target = now.replace(day=d, hour=h, minute=m, second=0, microsecond=0)
+                if target <= now:
+                    raise ValueError
+            except ValueError:
+                if now.month == 12:
+                    target = now.replace(year=now.year + 1, month=1, day=d, hour=h, minute=m, second=0, microsecond=0)
+                else:
+                    target = now.replace(month=now.month + 1, day=d, hour=h, minute=m, second=0, microsecond=0)
+        else:
+            wd         = cfg.get("reset_weekday", 0)
+            days_ahead = wd - now.weekday()
+            if days_ahead <= 0:
+                days_ahead += 7
+            target = (now + _timedelta(days=days_ahead)).replace(hour=h, minute=m, second=0, microsecond=0)
+            if target <= now:
+                target += _timedelta(days=7)
+        return target.isoformat()
+    except Exception:
+        return (datetime.now(TZ_WIB) + _timedelta(days=7)).isoformat()
+
+
+async def ns_track_message(chat_id: int, user_id: int, user_name: str) -> None:
+    """Tambah 1 poin skor untuk user di grup."""
+    try:
+        await newscore_stats_db.update_one(
+            {"chat_id": chat_id, "user_id": user_id},
+            {"$set":  {"user_name": user_name}, "$inc": {"score": 1}},
+            upsert=True,
+        )
+    except Exception as e:
+        print(f"[NewsCore] track error: {e}")
+
+
+async def ns_get_leaderboard(chat_id: int, limit: int = 10) -> list:
+    try:
+        cur = newscore_stats_db.find({"chat_id": chat_id}).sort("score", -1).limit(limit)
+        return await cur.to_list(length=limit)
+    except Exception:
+        return []
+
+
+async def ns_reset_scores(chat_id: int) -> None:
+    try:
+        await newscore_stats_db.delete_many({"chat_id": chat_id})
+    except Exception as e:
+        print(f"[NewsCore] reset error: {e}")
+
+
+async def ns_get_current_admins(chat_id: int) -> list:
+    try:
+        return await newscore_admin_db.find({"chat_id": chat_id}).to_list(length=20)
+    except Exception:
+        return []
+
+
+async def ns_set_current_admins(chat_id: int, admins: list) -> None:
+    try:
+        await newscore_admin_db.delete_many({"chat_id": chat_id})
+        if admins:
+            await newscore_admin_db.insert_many(admins)
+    except Exception as e:
+        print(f"[NewsCore] set admins error: {e}")
+

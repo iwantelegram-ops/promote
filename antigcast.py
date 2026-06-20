@@ -698,6 +698,10 @@ async def main():
         # start_userbot tidak blocking — ia menjalankan task sendiri di background.
         asyncio.create_task(start_userbot(app))
 
+        # ── NewsCore Time-Checker Loop ────────────────────────────────────────
+        from plugins.commands.newscore import newscore_checker_loop
+        asyncio.create_task(newscore_checker_loop(app))
+
         print("🚀 Bot Antispam + Nexus AI aktif! Tekan Ctrl+C untuk berhenti.")
         await idle()
     except (KeyboardInterrupt, asyncio.CancelledError):
