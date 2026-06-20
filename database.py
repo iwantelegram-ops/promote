@@ -1895,6 +1895,51 @@ async def reset_local_mute(chat_id: int, user_id: int) -> None:
 # GROUP ACTION LOG — log aksi per grup (hapus/mute/ban), TTL 7 hari
 # ══════════════════════════════════════════════════════════════════════════════
 
+# FIX (performa lambat saat buka/geser menu Log Aktivitas):
+#   Sebelumnya get_group_action_log_page menarik SEMUA dokumen grup itu dari DB
+#   ke memori (`.find({"chat_id": chat_id}).to_list(None)`), lalu filter/​sort
+#   7-hari dan cleanup expired dilakukan satu-per-satu di Python — termasuk
+#   `delete_one` berulang di dalam loop tiap kali halaman dibuka/digeser.
+#   Untuk grup yang sudah aktif berhari-hari, ini bisa berarti ribuan dokumen
+#   ditarik & di-sort ulang hanya untuk menampilkan 10 baris per halaman,
+#   sehingga next/prev terasa lambat.
+#
+#   Perbaikan:
+#     1. Index compound (chat_id, ts) dibuat sekali saat startup (idempotent)
+#        agar query & sort di MongoDB memakai index, bukan full scan.
+#     2. Query halaman langsung pakai sort+skip+limit di level DB (lewat
+#        AsyncCursor yang sudah mendukung ini di kedua backend), bukan narik
+#        semua dokumen lalu slice di Python.
+#     3. Total dihitung via count_documents (bukan len() dari semua dokumen).
+#     4. Cleanup entri expired (>7 hari) sekarang satu panggilan delete_many,
+#        bukan loop delete_one per dokumen.
+_group_action_log_index_created = False
+
+# Throttle cleanup expired — jangan delete_many di SETIAP render halaman,
+# cukup sekali per grup per _CLEANUP_INTERVAL detik (cleanup tetap akurat
+# karena query halaman selalu pakai filter ts > cutoff secara terpisah).
+_group_action_log_last_cleanup: dict[int, float] = {}
+_GROUP_ACTION_LOG_CLEANUP_INTERVAL = 600   # 10 menit
+
+
+async def _ensure_group_action_log_index() -> None:
+    """
+    Buat index compound (chat_id, ts desc) pada group_action_log.
+    Aman dipanggil berulang (idempotent) — no-op di SQLite.
+    """
+    global _group_action_log_index_created
+    if _group_action_log_index_created:
+        return
+    try:
+        from pymongo import ASCENDING, DESCENDING  # type: ignore
+        await group_action_log_db.create_index(
+            [("chat_id", ASCENDING), ("ts", DESCENDING)],
+        )
+        _group_action_log_index_created = True
+    except Exception as e:
+        print(f"[DB] Gagal buat index group_action_log: {e}")
+
+
 async def insert_group_action_log(
     chat_id:   int,
     aksi:      str,   # "HAPUS" | "MUTE" | "BAN"
@@ -1927,22 +1972,41 @@ async def get_group_action_log_page(
     """
     Ambil halaman log aksi grup (7 hari terakhir), urut terbaru dulu.
     Sekaligus bersihkan entri > 7 hari.
+
+    FIXED: tidak lagi menarik semua dokumen ke memori — sort/skip/limit
+    dilakukan di level DB, dan cleanup expired pakai satu delete_many.
     """
     try:
+        await _ensure_group_action_log_index()
         cutoff = time.time() - (7 * 86400)
-        all_docs = await group_action_log_db.find({"chat_id": chat_id}).to_list(None)
-        # Hapus yang sudah expired
-        old_ids = [d["_id"] for d in all_docs if d.get("ts", 0) < cutoff and "_id" in d]
-        for oid in old_ids:
+
+        # Bersihkan entri expired — di-throttle per grup, bukan setiap render.
+        # Query halaman tetap akurat karena selalu filter ts > cutoff secara
+        # terpisah, jadi entri expired tidak akan pernah tampil meski belum
+        # sempat dibersihkan dari DB.
+        now_mono = time.monotonic()
+        last_cleanup = _group_action_log_last_cleanup.get(chat_id, 0.0)
+        if now_mono - last_cleanup >= _GROUP_ACTION_LOG_CLEANUP_INTERVAL:
+            _group_action_log_last_cleanup[chat_id] = now_mono
             try:
-                await group_action_log_db.delete_one({"_id": oid})
+                await group_action_log_db.delete_many(
+                    {"chat_id": chat_id, "ts": {"$lt": cutoff}}
+                )
             except Exception:
                 pass
-        recent = [d for d in all_docs if d.get("ts", 0) >= cutoff]
-        recent.sort(key=lambda d: d.get("ts", 0), reverse=True)
-        total  = len(recent)
-        start  = (page - 1) * per_page
-        return recent[start:start + per_page], total
+
+        query = {"chat_id": chat_id, "ts": {"$gt": cutoff}}
+        total = await group_action_log_db.count_documents(query)
+
+        start = (page - 1) * per_page
+        docs  = await (
+            group_action_log_db.find(query)
+            .sort("ts", -1)
+            .skip(start)
+            .limit(per_page)
+            .to_list(None)
+        )
+        return docs, total
     except Exception as e:
         print(f"[DB] get_group_action_log_page error: {e}")
         return [], 0
