@@ -36,12 +36,18 @@ FLOW STARTUP:
   1. antigcast.py start → bot biasa aktif
   2. start_userbot(app) dipanggil → cek session userbot
   3a. Session ada → userbot langsung aktif
-  3b. Session tidak ada → bot masuk mode tunggu (log di console),
-      owner kirim /otp <kode> ke bot via DM → userbot login → session disimpan
+  3b. Session tidak ada → bot TIDAK memaksa OTP login otomatis.
+      Bot hanya kirim DM info ke OWNER_ID bahwa session userbot tidak
+      ditemukan. Owner login userbot baru kapan saja via panel:
+      Nexus AI → Owner Bot → Ganti Userbot (flow OTP interaktif ada di
+      sana, lihat ganti_userbot() / nx_setuserbot di nexus_handlers.py).
 
 VARIABEL .env BARU:
   USERBOT_PHONE — nomor HP akun userbot (format: +62xxx)
                   Jika kosong → Security OS tidak tersedia, bot berjalan normal.
+                  Tidak lagi dipakai untuk OTP login otomatis saat startup —
+                  hanya dipakai sebagai nilai awal/fallback; nomor aktif
+                  yang dipakai login selalu yang terbaru lewat Ganti Userbot.
 """
 
 from __future__ import annotations
@@ -967,7 +973,7 @@ async def start_userbot(bot: _Client) -> None:
     Entry point dipanggil dari antigcast.py setelah bot biasa aktif.
     Non-blocking — langsung return setelah create_task background loop.
     """
-    global userbot, _bot_ref, _ub_ready, _ub_self_id
+    global userbot, _bot_ref, _ub_ready, _ub_self_id, _ub_dead_notified
     _bot_ref = bot
 
     # Inisialisasi semaphore di dalam event loop yang aktif
@@ -1000,6 +1006,7 @@ async def start_userbot(bot: _Client) -> None:
             userbot    = ub
             _ub_self_id = me.id
             _ub_ready  = True
+            _ub_dead_notified = False   # reset — userbot baru berhasil aktif lagi
             print(f"[UB] ✅ Userbot aktif: {me.first_name} (id={me.id})")
             await _save_ub_session()
             # Log berapa grup Security OS yang sudah terdaftar di DB
@@ -1015,30 +1022,142 @@ async def start_userbot(bot: _Client) -> None:
                 pass
 
     # Tidak ada session / session rusak
-    if not USERBOT_PHONE:
-        print("[UB] ℹ️  USERBOT_PHONE tidak diset — Security OS tidak tersedia.")
+    # FIX (startup tidak boleh memaksa OTP): sebelumnya jika USERBOT_PHONE
+    # diset, bot langsung memulai _do_login() (flow OTP paksa) setiap kali
+    # session tidak ditemukan — termasuk tiap kali redeploy. Ini mengganggu
+    # karena owner harus selalu siap kirim /otp tiap restart, padahal akun
+    # userbot sudah bisa diganti kapan saja lewat Nexus AI > Owner Bot >
+    # Ganti Userbot (fungsi itu sudah berjalan baik, lihat ganti_userbot /
+    # nx_setuserbot — TIDAK disentuh oleh perubahan ini).
+    #
+    # Sekarang: jika session tidak ditemukan saat startup, bot HANYA
+    # mengirim DM info ke OWNER_ID — tidak ada OTP flow otomatis yang
+    # dipaksa berjalan. Owner login manual via panel saat siap.
+    print("[UB] ℹ️  Session userbot tidak ditemukan saat startup.")
+    await _notify_owner_session_missing(bot)
+    return
+
+
+async def _notify_owner_session_missing(bot: _Client) -> None:
+    """
+    Kirim DM ke OWNER_ID memberitahu bahwa session userbot tidak ditemukan
+    saat startup/redeploy — TANPA memulai OTP flow otomatis.
+
+    Owner login userbot baru secara manual via panel:
+    Nexus AI > Owner Bot > Ganti Userbot.
+    """
+    if not OWNER_ID:
+        print("[UB] ⚠️  OWNER_ID tidak diset — tidak bisa kirim notifikasi.")
         return
+    try:
+        await asyncio.wait_for(
+            bot.send_message(
+                OWNER_ID,
+                "⚠️ <b>Session Userbot Tidak Ditemukan</b>\n\n"
+                "Bot baru saja start/redeploy, tapi session akun userbot "
+                "(Security OS) tidak ditemukan di database maupun lokal.\n\n"
+                "Security OS untuk semua grup <b>tidak aktif</b> sampai "
+                "userbot login kembali.\n\n"
+                "Login akun userbot baru via:\n"
+                "<b>Nexus AI → Owner Bot → Ganti Userbot</b>",
+                parse_mode=ParseMode.HTML,
+            ),
+            timeout=8.0,
+        )
+        print("[UB] 📢 Notifikasi session userbot hilang terkirim ke owner.")
+    except Exception as e:
+        print(f"[UB] ⚠️  Gagal kirim notifikasi ke owner: {e}")
 
-    print("[UB] ℹ️  Session userbot tidak ada → mulai OTP login flow...")
-    result = await _do_login(bot)
 
-    # _do_login sekarang return (ok, self_id) — userbot sudah connected, JANGAN start() lagi
-    if isinstance(result, tuple):
-        ok, self_id = result
-    else:
-        ok, self_id = result, 0
+# ══════════════════════════════════════════════════════════════════════════════
+# DETEKSI SESSION USERBOT MATI SAAT SEDANG BERJALAN
+# (logout paksa dari Telegram, akun dinonaktifkan/dibanned, dll — bukan saat
+# startup, tapi di tengah operasi normal setelah sebelumnya berhasil login)
+# ══════════════════════════════════════════════════════════════════════════════
 
-    if ok and userbot:
-        try:
-            # Userbot sudah connected via connect()+sign_in() — set state langsung
-            _ub_self_id = self_id
-            _ub_ready   = True
-            await _log_registered_groups()
-            _safe_task(_voice_chat_monitor_loop(), tag="vc-monitor-loop")
-        except Exception as e:
-            print(f"[UB] Gagal aktivasi setelah login: {e}")
-    else:
-        print("[UB] ❌ Login userbot gagal — Security OS tidak aktif.")
+# Anti-spam: jangan kirim DM berulang kali untuk kematian session yang sama.
+# Reset otomatis setiap kali userbot berhasil login ulang (_ub_ready jadi True
+# lagi lewat start_userbot() / ganti_userbot()).
+_ub_dead_notified: bool = False
+
+
+def _is_session_dead_error(exc: BaseException) -> bool:
+    """
+    True jika exception ini menandakan session userbot sudah TIDAK VALID
+    lagi di sisi Telegram — logout paksa dari device lain, sesi dicabut,
+    akun dinonaktifkan, atau akun dibanned.
+
+    Dicek lewat nama class (bukan hanya isinstance) supaya tetap terdeteksi
+    walau ada perbedaan kecil di exception hierarchy antar versi pyrogram —
+    isinstance tetap dicoba dulu sebagai jalur utama yang lebih akurat.
+    """
+    try:
+        from pyrogram.errors import (
+            AuthKeyUnregistered,
+            UserDeactivated,
+            UserDeactivatedBan,
+        )
+        if isinstance(exc, (AuthKeyUnregistered, UserDeactivated, UserDeactivatedBan)):
+            return True
+    except ImportError:
+        pass
+
+    # Fallback berbasis nama class — aman dari perbedaan versi pyrogram
+    name = type(exc).__name__
+    return name in (
+        "AuthKeyUnregistered",
+        "UserDeactivated",
+        "UserDeactivatedBan",
+        "SessionRevoked",
+        "AuthKeyInvalid",
+    )
+
+
+async def _handle_userbot_session_dead(reason: str) -> None:
+    """
+    Dipanggil saat terdeteksi session userbot sudah tidak valid di tengah
+    operasi normal (bukan saat startup). Menandai userbot sebagai tidak
+    siap dan mengirim DM sekali ke OWNER_ID — tidak diulang tiap siklus.
+
+    Owner login userbot baru via: Nexus AI → Owner Bot → Ganti Userbot
+    (TIDAK ada OTP otomatis yang dipaksa di sini, sama seperti perilaku
+    saat startup session tidak ditemukan).
+    """
+    global _ub_ready, _ub_dead_notified
+
+    was_ready = _ub_ready
+    _ub_ready = False
+
+    if _ub_dead_notified:
+        # Sudah pernah diberitahu untuk kematian session ini — jangan spam DM
+        return
+    _ub_dead_notified = True
+
+    if was_ready:
+        print(f"[UB] 🛑 Session userbot tidak valid lagi ({reason}). Security OS dihentikan.")
+
+    if not OWNER_ID or not _bot_ref:
+        print("[UB] ⚠️  OWNER_ID/_bot_ref tidak tersedia — tidak bisa kirim notifikasi.")
+        return
+    try:
+        await asyncio.wait_for(
+            _bot_ref.send_message(
+                OWNER_ID,
+                "🛑 <b>Session Userbot Terputus</b>\n\n"
+                "Akun userbot (Security OS) terdeteksi <b>logout/sesi dicabut</b> "
+                "dari sisi Telegram saat sedang berjalan.\n\n"
+                f"<i>Detail:</i> <code>{reason}</code>\n\n"
+                "Security OS untuk semua grup <b>tidak aktif</b> sampai "
+                "userbot login kembali.\n\n"
+                "Login akun userbot baru via:\n"
+                "<b>Nexus AI → Owner Bot → Ganti Userbot</b>",
+                parse_mode=ParseMode.HTML,
+            ),
+            timeout=8.0,
+        )
+        print("[UB] 📢 Notifikasi session userbot terputus terkirim ke owner.")
+    except Exception as e:
+        print(f"[UB] ⚠️  Gagal kirim notifikasi session terputus ke owner: {e}")
 
 
 async def stop_userbot() -> None:
@@ -1422,6 +1541,9 @@ async def _vc_join_raw(chat_id: int, call_id: int, access_hash: int) -> bool:
         await asyncio.sleep(fw.value + 1)
         return False
     except Exception as e:
+        if _is_session_dead_error(e):
+            await _handle_userbot_session_dead(f"{type(e).__name__}: {e}")
+            return False
         err_str = str(e).lower()
         if "already" in err_str:
             return True   # Sudah di VC — anggap berhasil
@@ -1454,6 +1576,9 @@ async def _vc_get_call_info(chat_id: int):
         await asyncio.sleep(fw.value + 1)
         return None, None
     except Exception as e:
+        if _is_session_dead_error(e):
+            await _handle_userbot_session_dead(f"{type(e).__name__}: {e}")
+            return None, None
         print(f"[UB-VC] Gagal GetFullChannel grup {chat_id}: {e}")
         return None, None
 
@@ -2912,7 +3037,7 @@ async def change_userbot(
     Dipanggil dari handler UI secos_setuserbot_{chat_id} di handlers_secos.py.
     Return: (berhasil: bool, pesan_hasil: str)
     """
-    global userbot, _ub_ready, _ub_self_id, USERBOT_PHONE
+    global userbot, _ub_ready, _ub_self_id, USERBOT_PHONE, _ub_dead_notified
 
     # ── 1. Validasi format nomor ─────────────────────────────────────────
     clean_phone = new_phone.strip()
@@ -2986,6 +3111,7 @@ async def change_userbot(
     # ── 5. Aktifkan ──────────────────────────────────────────────────────
     _ub_self_id = self_id
     _ub_ready   = True
+    _ub_dead_notified = False   # reset — userbot baru berhasil aktif lagi
     try:
         me = await userbot.get_me()
         uname = me.username or me.first_name or str(me.id)
