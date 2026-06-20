@@ -1026,6 +1026,47 @@ async def _migrate_sqlite_to_mongo():
         print(f"[Migrasi SQLite→Mongo] ✅ Semua data SQLite sudah ada di MongoDB ({total_skipped} duplikat). Tidak ada yang perlu dipindah.")
 
 
+async def _create_panel_indexes() -> None:
+    """
+    Buat index untuk koleksi yang dipakai berulang dari tombol-tombol panel
+    grup (chat_id sebagai filter utama, beberapa juga user_id).
+
+    Idempotent — aman dipanggil tiap startup. No-op total di SQLite
+    (lihat implementasi Collection.create_index). TIDAK mengubah query,
+    hasil, maupun urutan logika apapun di kode lain — index hanya
+    membuat MongoDB menemukan dokumen yang sama jauh lebih cepat,
+    tanpa full collection scan lintas semua grup setiap kali tombol
+    panel grup diklik.
+    """
+    if _BACKEND != "mongo":
+        return
+    try:
+        from pymongo import ASCENDING  # type: ignore
+
+        # status (config_db) — dibaca tiap kali panel grup manapun dibuka
+        # (get_config), sekalipun ada cache TTL in-memory di atasnya.
+        await config_db.create_index([("chat_id", ASCENDING)])
+
+        # regex_per_group — panel utama (hitung jumlah filter) & daftar regex
+        await db["regex_per_group"].create_index([("chat_id", ASCENDING)])
+
+        # free_per_group — panel utama (hitung VIP) & daftar Member VIP,
+        # juga dicek per (chat_id, user_id) di banyak filter pesan.
+        await db["free_per_group"].create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)])
+
+        # whitelist_per_group — panel CAS & daftar whitelist,
+        # juga dicek per (chat_id, user_id) di filter CAS.
+        await db["whitelist_per_group"].create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)])
+
+        # security_os — dibaca _sec_os_get setiap render/toggle panel Security OS
+        await db["security_os"].create_index([("chat_id", ASCENDING)])
+
+        # vc_muted_by_ub — dicek tiap /unmutemic dan tiap siklus scan VC
+        await db["vc_muted_by_ub"].create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)])
+    except Exception as e:
+        print(f"[DB] Gagal buat index panel: {e}")
+
+
 async def setup_db():
     """
     Inisialisasi backend (MongoDB atau SQLite) dan mulai background cleanup.
@@ -1053,6 +1094,17 @@ async def setup_db():
     # ── Migrasi data lama (tanpa CODE_BOT prefix) ke namespace aktif ─────────
     if _CODE_BOT:
         await _migrate_legacy_data()
+
+    # ── Index performa: koleksi yang dipakai berulang dari tombol panel ─────
+    # FIX (tombol panel terasa berat): koleksi-koleksi ini di-query dengan
+    # filter chat_id (dan/atau user_id) setiap kali tombol grup terkait
+    # diklik (panel utama, regex, whitelist, free/VIP, Security OS, dll),
+    # tapi tidak punya index sama sekali — di MongoDB artinya full collection
+    # scan lintas SEMUA grup setiap klik. Penambahan index ini TIDAK
+    # mengubah hasil/logika apapun, hanya membuat query yang SAMA jadi
+    # lebih cepat dicari oleh database. Idempotent & no-op di SQLite
+    # (lihat Collection.create_index).
+    await _create_panel_indexes()
 
     # ── Banner detail startup ─────────────────────────────────────────────────
     sep = "─" * 52
