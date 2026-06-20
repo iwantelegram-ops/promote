@@ -256,11 +256,6 @@ async def _vc_join_queue_worker() -> None:
                 if not q.empty():
                     await asyncio.sleep(_VC_WORKER_LEAVE_DELAY)
 
-        except FloodWait as fw:
-            wait_sec = fw.value + 2
-            print(f"[VC-Worker] FloodWait {fw.value}s saat action={action} grup={chat_id} — menunggu {wait_sec}s...")
-            _vc_join_pending.discard(chat_id)
-            await asyncio.sleep(wait_sec)
         except Exception as e:
             print(f"[VC-Worker] Error saat proses action={action} grup={chat_id}: {e}")
             _vc_join_pending.discard(chat_id)
@@ -386,10 +381,6 @@ async def _mic_action_worker(chat_id: int) -> None:
             elif action == "unmute":
                 print(f"[Mic-Worker] Unmute mic uid={user_id} grup={chat_id} — alasan: {reason}")
                 await _unmute_user_in_vc(chat_id, user_id, call_input)
-        except FloodWait as fw:
-            wait_sec = fw.value + 2
-            print(f"[Mic-Worker] FloodWait {fw.value}s saat {action} uid={user_id} grup={chat_id} — menunggu {wait_sec}s...")
-            await asyncio.sleep(wait_sec)
         except Exception as e:
             print(f"[Mic-Worker] Error {action} uid={user_id} grup={chat_id}: {e}")
         finally:
@@ -576,10 +567,6 @@ async def _warn_worker(chat_id: int) -> None:
             break
         try:
             await _do_send_warning(chat_id, user_id)
-        except FloodWait as fw:
-            wait_sec = fw.value + 2
-            print(f"[UB-Warn] FloodWait {fw.value}s di warn worker grup={chat_id} uid={user_id} — menunggu {wait_sec}s...")
-            await asyncio.sleep(wait_sec)
         except Exception as e:
             print(f"[UB-Warn] Worker error uid={user_id} grup={chat_id}: {e}")
         q.task_done()
@@ -595,7 +582,7 @@ def _enqueue_warning(chat_id: int, user_id: int) -> None:
     # Spawn worker hanya jika tidak ada yang berjalan
     existing = _warn_workers.get(chat_id)
     if existing is None or existing.done():
-        task = _safe_task(_warn_worker(chat_id), tag=f"warn-worker-{chat_id}")
+        task = asyncio.create_task(_warn_worker(chat_id))
         _warn_workers[chat_id] = task
 
 # ── Throttle scan grup aktif — cegah spawn task tak terbatas ─────────────────
@@ -990,7 +977,7 @@ async def start_userbot(bot: _Client) -> None:
             await _save_ub_session()
             # Log berapa grup Security OS yang sudah terdaftar di DB
             await _log_registered_groups()
-            _safe_task(_voice_chat_monitor_loop(), tag="vc-monitor-loop")
+            asyncio.create_task(_voice_chat_monitor_loop())
             return
         except Exception as e:
             print(f"[UB] ⚠️  Session ada tapi gagal start ({type(e).__name__}): {e}")
@@ -1020,7 +1007,7 @@ async def start_userbot(bot: _Client) -> None:
             _ub_self_id = self_id
             _ub_ready   = True
             await _log_registered_groups()
-            _safe_task(_voice_chat_monitor_loop(), tag="vc-monitor-loop")
+            asyncio.create_task(_voice_chat_monitor_loop())
         except Exception as e:
             print(f"[UB] Gagal aktivasi setelah login: {e}")
     else:
@@ -1354,11 +1341,11 @@ async def _voice_chat_monitor_loop() -> None:
     # berada di dalam VC. Jika VC sudah aktif sebelum bot start (dan tidak ada
     # UpdateGroupCall baru yang diterima), userbot tidak akan pernah masuk VC
     # kecuali join manual di sini.
-    asyncio.ensure_future(_safe_task(_vc_scheduled_loop(), tag="vc-scheduled-loop"))
+    asyncio.create_task(_vc_scheduled_loop())
     print("[UB-VC] Scheduler join VC 30 menit dimulai.")
 
     # Cache cleanup loop — bersihkan entri cache kedaluwarsa tiap 10 menit
-    asyncio.ensure_future(_safe_task(_cache_cleanup_loop(), tag="cache-cleanup-loop"))
+    asyncio.create_task(_cache_cleanup_loop())
     print("[UB-Cache] Cache cleanup loop dimulai (interval 10 menit).")
 
     # Jaga task tetap hidup
@@ -2178,7 +2165,7 @@ async def _secos_followup_recheck(chat_id: int, muted_users: list[tuple[int, str
     # Antri scan ke worker (bukan langsung — aman API, tidak bentrok dengan siklus lain)
     _enqueue_vc_scan(chat_id)
     # Tunggu sebentar agar worker sempat proses scan sebelum kita cek hasilnya
-    await asyncio.sleep(_VC_WORKER_JOIN_DELAY + _VC_SCAN_DURATION + 15)   # jeda join + estimasi durasi scan + buffer
+    await asyncio.sleep(_VC_WORKER_JOIN_DELAY + 35)   # jeda join + estimasi durasi scan
 
     # ── Periksa siapa yang masih belum valid setelah cek 1 menit ─────────────
     # Catatan: hanya reason_type "non_member" yang bisa masuk sini sekarang.
@@ -2231,7 +2218,7 @@ async def _secos_followup_recheck(chat_id: int, muted_users: list[tuple[int, str
     # Antri scan ke worker untuk cek terakhir
     _enqueue_vc_scan(chat_id)
     # Tunggu agar worker sempat proses sebelum follow-up task selesai
-    await asyncio.sleep(_VC_WORKER_JOIN_DELAY + _VC_SCAN_DURATION + 15)   # jeda join + estimasi durasi scan + buffer
+    await asyncio.sleep(_VC_WORKER_JOIN_DELAY + 35)
 
     # ── Fitur 4: Selesai — kembali ke jadwal 30 menit normal ─────────────────
     # _vc_scheduled_loop tetap berjalan sendiri, tidak perlu tindakan tambahan.
@@ -2381,4 +2368,931 @@ async def _is_vip_user(chat_id: int, user_id: int) -> bool:
     """
     Cek apakah user adalah Member VIP di grup ini.
 
-    VIP = ada di colle
+    VIP = ada di collection free_per_group {user_id, chat_id}.
+    User VIP BEBAS dari semua tindakan Security OS (mute mic non-member dan bio-link).
+
+    Return True jika VIP, False jika bukan (termasuk saat error — aman ke bawah).
+    Hasil di-cache 3 menit untuk performa.
+    """
+    key = (chat_id, user_id)
+    cached = _vip_cache.get(key)
+    if cached:
+        is_vip, ts = cached
+        if time.monotonic() - ts < _VIP_CACHE_TTL:
+            return is_vip
+
+    try:
+        db, _, _ = _get_db()
+        doc = await db["free_per_group"].find_one(
+            {"user_id": user_id, "chat_id": chat_id},
+        )
+        is_vip = doc is not None
+        _vip_cache[key] = (is_vip, time.monotonic())
+        return is_vip
+    except Exception as e:
+        print(f"[UB-VIP] Gagal cek VIP uid={user_id} grup={chat_id}: {e}")
+        return False   # safe default: anggap bukan VIP jika cek gagal
+
+
+def invalidate_vip_cache(chat_id: int, user_id: int) -> None:
+    """
+    Hapus entri cache VIP untuk (chat_id, user_id) ini.
+
+    WAJIB dipanggil setelah /vip, /unvip, atau tombol UI VIP/unvip mengubah
+    status VIP di DB (free_per_group). Tanpa ini, _is_vip_user() bisa
+    mengembalikan status VIP yang sudah basi selama TTL cache (3 menit) belum
+    habis — contoh kasus nyata: user baru di-VIP-kan lalu langsung /unmutemic
+    dalam window 3 menit tersebut, bot masih membaca cache lama "bukan VIP"
+    sehingga /unmutemic salah jalur (cek bio dulu) dan userbot tidak/lambat
+    naik ke voice chat.
+
+    Aman dipanggil meski entri belum ada di cache (no-op).
+    """
+    _vip_cache.pop((chat_id, user_id), None)
+
+
+async def _cache_cleanup_loop() -> None:
+    """
+    Bersihkan entri cache kedaluwarsa setiap 10 menit — cegah memory leak.
+
+    Cache yang dibersihkan:
+      - _bio_cache        : TTL 60 detik (bersihkan entri > 3x TTL)
+      - _member_cache     : TTL 2 menit
+      - _vip_cache        : TTL 3 menit
+      - _admin_cache      : TTL 5 menit
+      - _warn_workers     : hapus referensi task yang sudah selesai
+      - _processing_kick  : log jika terlalu besar (kemungkinan stuck)
+
+    Loop ini berjalan selama userbot aktif (_ub_ready=True).
+    """
+    _CLEANUP_INTERVAL = 600  # 10 menit
+    while _ub_ready and userbot:
+        await asyncio.sleep(_CLEANUP_INTERVAL)
+        if not _ub_ready:
+            break
+        now = time.monotonic()
+        cleaned = 0
+
+        # Bio cache — entri yang sudah 3× TTL pasti tidak akan dipakai lagi
+        stale = [k for k, (_, ts) in list(_bio_cache.items()) if now - ts > _BIO_CACHE_TTL * 3]
+        for k in stale:
+            _bio_cache.pop(k, None)
+        cleaned += len(stale)
+
+        # Member cache
+        stale = [k for k, (_, ts) in list(_member_cache.items()) if now - ts > _MEMBER_CACHE_TTL * 3]
+        for k in stale:
+            _member_cache.pop(k, None)
+        cleaned += len(stale)
+
+        # VIP cache
+        stale = [k for k, (_, ts) in list(_vip_cache.items()) if now - ts > _VIP_CACHE_TTL * 3]
+        for k in stale:
+            _vip_cache.pop(k, None)
+        cleaned += len(stale)
+
+        # Admin cache
+        stale = [cid for cid, (_, ts) in list(_admin_cache.items()) if now - ts > _ADMIN_CACHE_TTL * 3]
+        for cid in stale:
+            _admin_cache.pop(cid, None)
+        cleaned += len(stale)
+
+        # Warn workers: bersihkan referensi task yang sudah selesai
+        done_workers = [cid for cid, t in list(_warn_workers.items()) if t.done()]
+        for cid in done_workers:
+            _warn_workers.pop(cid, None)
+
+        # SecOS muted users cache — bersihkan entri yang sudah > TTL 30 detik
+        now_mono = time.monotonic()
+        stale_secos = [
+            k for k, (_, ts) in list(_secos_muted_users.items())
+            if now_mono - ts > _SECOS_MUTE_CACHE_TTL * 3
+        ]
+        for k in stale_secos:
+            _secos_muted_users.pop(k, None)
+        cleaned += len(stale_secos)
+
+        # SecOS follow-up tasks — bersihkan referensi task yang sudah selesai
+        done_followup = [cid for cid, t in list(_secos_followup_tasks.items()) if t.done()]
+        for cid in done_followup:
+            _secos_followup_tasks.pop(cid, None)
+
+        # Mic workers — bersihkan referensi task yang sudah selesai
+        done_mic = [cid for cid, t in list(_mic_workers.items()) if t.done()]
+        for cid in done_mic:
+            _mic_workers.pop(cid, None)
+
+        # Mic pending — bersihkan entri yang mungkin stuck (worker crash tanpa finally)
+        # Normalnya _mic_pending dibersihkan di finally worker, ini safety net.
+        if len(_mic_pending) > 50:
+            print(f"[UB-Cache] ⚠️ _mic_pending: {len(_mic_pending)} entri — kemungkinan ada yang stuck, reset.")
+            _mic_pending.clear()
+
+        # VC join pending — bersihkan jika terlalu besar (worker restart atau crash)
+        if len(_vc_join_pending) > 20:
+            print(f"[UB-Cache] ⚠️ _vc_join_pending: {len(_vc_join_pending)} entri — reset.")
+            _vc_join_pending.clear()
+
+        # Processing kick safety: log jika terlalu besar (bisa ada yang stuck)
+        stuck_count = len(_processing_kick)
+        if stuck_count > 30:
+            print(f"[UB-Cache] ⚠️ _processing_kick: {stuck_count} entri — mungkin ada yang stuck")
+
+        total = (
+            len(_bio_cache) + len(_member_cache) + len(_vip_cache) +
+            len(_admin_cache) + len(_processing_kick)
+        )
+        if cleaned > 0:
+            print(f"[UB-Cache] Cleanup: {cleaned} entri dihapus — total cache aktif: {total}")
+
+
+async def _get_monitor_username(monitor_bot_id: int) -> str:
+    """Ambil username bot pemantau (cache di memory). Masih dipakai di panel UI."""
+    if monitor_bot_id in _monitor_username_cache:
+        return _monitor_username_cache[monitor_bot_id]
+    try:
+        if userbot:
+            user = await userbot.get_users(monitor_bot_id)
+            uname = user.username or str(monitor_bot_id)
+        else:
+            uname = str(monitor_bot_id)
+    except Exception:
+        uname = str(monitor_bot_id)
+    _monitor_username_cache[monitor_bot_id] = uname
+    return uname
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EKSEKUSI: MUTE MIC DI VOICE CHAT + PERINGATAN
+# (Security OS: BUKAN kick dari grup — hanya mute mic VC)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _execute_kick(
+    chat_id: int,
+    user_id: int,
+    call_input,
+    was_already_muted: bool = False,
+    reason: str = "bio mengandung link",
+) -> None:
+    """
+    Mute mic user dari voice chat, lalu antrekan peringatan ke grup.
+
+    was_already_muted=True berarti user SUDAH di-mute sebelum userbot bertindak.
+    Dalam kasus ini: SKIP sepenuhnya — tidak mute ulang, tidak LOG_OS, tidak notif.
+    LOG_OS dan notif hanya dikirim untuk PERUBAHAN STATUS NYATA (unmuted → muted).
+
+    reason: alasan mute — diteruskan ke _do_send_warning dan LOG_OS.
+
+    Alur (dengan Mic Worker Queue):
+      1. Jika was_already_muted=True → skip seluruhnya (tidak ada perubahan status)
+      2. Antri mute mic ke _mic_action_worker → _kick_from_voice
+         → Jika API return sudah-muted (GROUP_CALL_NOT_MODIFIED) → skip LOG_OS
+      3. LOG_OS hanya jika benar-benar terjadi perubahan status (unmuted → muted)
+      4. Catat ke DB (vc_muted_by_ub)
+      5. Antrekan notifikasi grup hanya jika perubahan status nyata
+    """
+    try:
+        # ── VIP Guard — cek sebelum APAPUN ────────────────────────────────────
+        if await _is_vip_user(chat_id, user_id):
+            print(f"[UB-Exec] uid={user_id} grup={chat_id}: VIP → skip mute mic Security OS.")
+            return
+
+        # ── Poin 1: Skip jika sudah muted — tidak ada perubahan status ────────
+        # was_already_muted=True berarti Telegram sudah melaporkan user ini muted.
+        # Mute ulang tidak akan mengubah apapun; LOG_OS dan notif tidak relevan.
+        if was_already_muted:
+            print(
+                f"[UB-Exec] uid={user_id} grup={chat_id}: "
+                "sudah muted sebelumnya → skip (tidak mute ulang, tidak LOG_OS, tidak notif)."
+            )
+            return
+
+        # ── Antri mute mic ke worker — eksekusi berurutan per grup ────────────
+        _enqueue_mute_mic(chat_id, user_id, call_input, reason)
+        # LOG_OS: perubahan status nyata (unmuted → muted) — dicatat di sini
+        _safe_task(_log_os_action(chat_id, user_id, "MUTE-MIC", reason), tag="log-os")
+        # Catat ke DB bahwa userbot yang mute-kan user ini
+        _safe_task(_record_ub_muted(chat_id, user_id), tag="record-muted")
+        # Notifikasi grup: perubahan status nyata
+        _pending_warn_reason[(chat_id, user_id)] = reason
+        _enqueue_warning(chat_id, user_id)
+
+    except Exception as e:
+        print(f"[UB-Exec] Error saat kick uid={user_id} di grup {chat_id}: {e}")
+    finally:
+        _processing_kick.discard((chat_id, user_id))
+
+
+async def _kick_from_voice(chat_id: int, user_id: int, call_input) -> None:
+    """
+    Mute mic user di obrolan suara menggunakan raw API Telegram.
+
+    ── CATATAN PERUBAHAN ────────────────────────────────────────────────────
+    Telegram tidak lagi mengizinkan kick paksa dari VC oleh admin/userbot
+    (error: VIDEO_STOP_FORBIDDEN). Sebagai gantinya, userbot akan mute mic
+    user saja (muted=True) — user masih di VC tapi tidak bisa berbicara.
+
+    Metode API: phone.EditGroupCallParticipant (MTProto)
+      • Parameter yang diset: muted=True SAJA.
+      • Efek: mic user di-mute paksa — user tidak bisa berbicara di VC.
+      • Userbot harus punya izin "Kelola Obrolan Video" (manage_video_chats).
+      • Userbot TIDAK perlu berada di dalam VC.
+
+    Setelah mute berhasil, _execute_kick() mengantrekan notifikasi teks
+    ke grup via _enqueue_warning() dengan jeda antar pesan.
+    """
+    if not userbot:
+        return
+    try:
+        from pyrogram.raw import functions as _rf
+        peer = await userbot.resolve_peer(user_id)
+        await userbot.invoke(
+            _rf.phone.EditGroupCallParticipant(
+                call=call_input,
+                participant=peer,
+                muted=True,
+            )
+        )
+        print(f"[UB-VC] ✅ Mic user {user_id} di-mute di voice chat grup {chat_id}")
+    except FloodWait as fw:
+        print(f"[UB-VC] FloodWait {fw.value}s saat mute mic uid={user_id} — menunggu & retry...")
+        await asyncio.sleep(fw.value + 1)
+        # Coba sekali lagi setelah FloodWait
+        try:
+            from pyrogram.raw import functions as _rf2
+            peer2 = await userbot.resolve_peer(user_id)
+            await userbot.invoke(
+                _rf2.phone.EditGroupCallParticipant(
+                    call=call_input,
+                    participant=peer2,
+                    muted=True,
+                )
+            )
+            print(f"[UB-VC] ✅ Retry mute mic uid={user_id} di grup {chat_id} berhasil")
+        except Exception as e2:
+            print(f"[UB-VC] Retry mute mic uid={user_id} gagal: {e2}")
+    except Exception as e:
+        print(f"[UB-VC] Gagal mute mic uid={user_id} dari voice chat: {e}")
+
+
+async def _unmute_user_in_vc(chat_id: int, user_id: int, call_input) -> None:
+    """
+    Unmute mic user di obrolan suara grup.
+
+    Dipanggil dari _query_monitor_then_kick HANYA jika:
+      1. User sedang di-mute (is_muted=True) saat naik VC
+      2. Bio sudah bersih (has_link=False)
+      3. Userbot yang dulu mute user ini (DB collection vc_muted_by_ub)
+
+    Alur setelah unmute berhasil:
+      → Hapus catatan mute dari DB (vc_muted_by_ub)
+      → Hapus cache bio user ini
+      → Kirim notifikasi ke grup (perubahan status: muted → unmuted)
+      → Auto-hapus notifikasi setelah 10 detik
+
+    Jika API mengembalikan GROUP_CALL_NOT_MODIFIED (user sudah unmuted) →
+      TIDAK kirim notifikasi (tidak ada perubahan status).
+
+    Userbot harus punya izin "Kelola Obrolan Video" (manage_video_chats).
+    """
+    if not userbot:
+        return
+
+    async def _do_unmute() -> bool:
+        """Lakukan unmute via raw API. Return True jika berhasil, False jika user sudah unmuted."""
+        from pyrogram.raw import functions as _rf
+        peer = await userbot.resolve_peer(user_id)
+        try:
+            await userbot.invoke(
+                _rf.phone.EditGroupCallParticipant(
+                    call=call_input,
+                    participant=peer,
+                    muted=False,
+                )
+            )
+            return True
+        except Exception as e:
+            err_str = str(e).lower()
+            if "not_modified" in err_str or "group_call_not_modified" in err_str:
+                # User sudah tidak di-mute — tidak ada perubahan status → skip notif
+                print(
+                    f"[UB-VC] uid={user_id} grup={chat_id}: "
+                    "sudah unmuted sebelumnya — skip notifikasi ke grup"
+                )
+                return False
+            raise   # lempar ke caller untuk penanganan lain
+
+    try:
+        changed = await _do_unmute()
+        print(
+            f"[UB-VC] ✅ Mic user {user_id} di-unmute di obrolan suara grup {chat_id} "
+            f"(bio bersih, {'notif dikirim' if changed else 'sudah unmuted sebelumnya'})"
+        )
+
+        # Hapus catatan mute userbot dari DB
+        _safe_task(_remove_ub_muted(chat_id, user_id), tag="rm-muted-unmute")
+
+        # Hapus cache bio agar status selalu dicek fresh berikutnya
+        _bio_cache.pop((chat_id, user_id), None)
+
+        # Perubahan 2: log unmute ke channel LOG_OS
+        if changed:
+            _safe_task(
+                _log_os_action(chat_id, user_id, "UNMUTE-MIC", "bio bersih / tidak ada link"),
+                tag="log-os-unmute",
+            )
+
+        # Kirim notifikasi ke grup HANYA jika ini perubahan status
+        if changed and _bot_ref:
+            try:
+                u = await _bot_ref.get_users(user_id)
+                name = u.first_name or str(user_id)
+            except Exception:
+                name = str(user_id)
+            mention = f"<a href='tg://user?id={user_id}'>{name}</a>"
+            notif_text = (
+                f"🔊 {mention} mic-nya telah diaktifkan kembali.\n"
+                f"<i>Bio sudah tidak mengandung link.</i>"
+            )
+            try:
+                sent = await _bot_ref.send_message(chat_id, notif_text, parse_mode=ParseMode.HTML)
+                async def _auto_del(msg=sent):
+                    await asyncio.sleep(10)
+                    try:
+                        await msg.delete()
+                    except Exception:
+                        pass
+                asyncio.create_task(_auto_del())
+            except FloodWait as fw:
+                print(f"[UB-Unmute] FloodWait {fw.value}s saat kirim notif unmute uid={user_id}")
+                await asyncio.sleep(fw.value + 1)
+                try:
+                    sent = await _bot_ref.send_message(chat_id, notif_text, parse_mode=ParseMode.HTML)
+                    async def _auto_del2(msg=sent):
+                        await asyncio.sleep(10)
+                        try:
+                            await msg.delete()
+                        except Exception:
+                            pass
+                    asyncio.create_task(_auto_del2())
+                except Exception as e2:
+                    print(f"[UB-Unmute] Retry notif unmute uid={user_id} gagal: {e2}")
+            except Exception as e:
+                print(f"[UB-Unmute] Gagal kirim notif unmute uid={user_id}: {e}")
+
+            # Catat ke log aktivitas grup — perubahan status nyata (muted → unmuted)
+            try:
+                from database import insert_group_action_log
+                await insert_group_action_log(
+                    chat_id,
+                    "UNMUTE-VC-MIC",
+                    "Security OS: mic diaktifkan kembali (bio bersih / tidak ada link)",
+                    user_id,
+                    name[:50],
+                )
+            except Exception as _e_log:
+                print(f"[UB-Unmute] Gagal catat log unmute uid={user_id}: {_e_log}")
+
+    except FloodWait as fw:
+        print(f"[UB-VC] FloodWait {fw.value}s saat unmute uid={user_id} — menunggu & retry...")
+        await asyncio.sleep(fw.value + 1)
+        try:
+            changed = await _do_unmute()
+            if changed:
+                print(f"[UB-VC] ✅ Retry unmute mic uid={user_id} di grup {chat_id} berhasil")
+                _safe_task(_remove_ub_muted(chat_id, user_id), tag="rm-muted-retry")
+            _bio_cache.pop((chat_id, user_id), None)
+        except Exception as e2:
+            print(f"[UB-VC] Retry unmute uid={user_id} gagal: {e2}")
+    except Exception as e:
+        print(f"[UB-VC] Gagal unmute mic uid={user_id} dari obrolan suara: {e}")
+
+
+async def _do_send_warning(chat_id: int, user_id: int) -> None:
+    """
+    Bot biasa mengirim peringatan di grup kepada user yang diturunkan.
+    Juga mencatat ke group_action_log (pakai fungsi asli database.py).
+
+    DIPANGGIL OLEH _warn_worker — tidak langsung, selalu via _enqueue_warning().
+    FloodWait ditangani di sini: tunggu dan coba ulang sekali.
+    """
+    if not _bot_ref:
+        return
+    try:
+        from database import insert_group_action_log
+
+        # Ambil nama user
+        name = str(user_id)
+        try:
+            u = await _bot_ref.get_users(user_id)
+            name = u.first_name or str(user_id)
+        except Exception:
+            pass
+
+        mention = f"<a href='tg://user?id={user_id}'>{name}</a>"
+
+        # Kirim peringatan di grup via bot biasa — tangani FloodWait
+        # Perubahan 2: ambil alasan dari _pending_warn_reason
+        warn_reason = _pending_warn_reason.pop((chat_id, user_id), "bio mengandung link")
+        if "non-member" in warn_reason:
+            warn_msg = (
+                f"🔇 {mention} mic-nya di-mute di obrolan suara.\n"
+                f"<i>Anda bukan anggota grup ini. "
+                f"Bergabunglah ke grup terlebih dahulu agar mic dapat diaktifkan.</i>"
+            )
+        elif "peer tidak dikenal" in warn_reason or "peer_invalid" in warn_reason:
+            warn_msg = (
+                f"🔇 {mention} mic-nya di-mute sementara di obrolan suara.\n"
+                f"<i>Profil Anda belum dapat diverifikasi. "
+                f"Kirim pesan di grup ini terlebih dahulu agar sistem dapat mengenali Anda, "
+                f"kemudian mic akan diaktifkan kembali secara otomatis.</i>"
+            )
+        else:
+            warn_msg = (
+                f"🔇 {mention} mic-nya di-mute di obrolan suara.\n"
+                f"<i>Bio Anda mengandung link/username. "
+                f"Hapus link atau privatkan bio agar mic dapat diaktifkan kembali.</i>"
+            )
+        sent_warn = None
+        try:
+            sent_warn = await _bot_ref.send_message(chat_id, warn_msg, parse_mode=ParseMode.HTML)
+        except FloodWait as fw_warn:
+            print(f"[UB-Warn] FloodWait {fw_warn.value}s saat kirim warn ke grup {chat_id} — menunggu...")
+            await asyncio.sleep(fw_warn.value + 1)
+            try:
+                sent_warn = await _bot_ref.send_message(chat_id, warn_msg, parse_mode=ParseMode.HTML)
+            except Exception as e2:
+                print(f"[UB-Warn] Retry warn gagal uid={user_id}: {e2}")
+
+        # Hapus pesan peringatan otomatis setelah 10 detik
+        if sent_warn:
+            async def _auto_delete_warn(msg=sent_warn):
+                await asyncio.sleep(10)
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+            asyncio.create_task(_auto_delete_warn())
+
+        # Catat ke log aktivitas grup (fungsi asli database.py)
+        # Tentukan label alasan yang tepat berdasarkan warn_reason
+        if "non-member" in warn_reason:
+            log_alasan = "Security OS: bukan anggota grup, mic di-mute di obrolan suara"
+        elif "peer tidak dikenal" in warn_reason or "peer_invalid" in warn_reason:
+            log_alasan = "Security OS: profil belum terverifikasi, mic di-mute sementara"
+        else:
+            log_alasan = "Security OS: bio mengandung link, mic di-mute di obrolan suara"
+
+        await insert_group_action_log(
+            chat_id,
+            "MUTE-VC-MIC",
+            log_alasan,
+            user_id,
+            name[:50],
+        )
+
+        # Hapus cache bio user ini agar bisa naik lagi setelah benahi bio
+        _bio_cache.pop((chat_id, user_id), None)
+
+    except Exception as e:
+        print(f"[UB-Warn] Gagal kirim peringatan uid={user_id}: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SETUP BOT PEMANTAU
+# Dipanggil dari handler UI saat admin memasukkan token bot pemantau baru.
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def change_userbot(
+    new_phone: str,
+    bot: _Client,
+) -> tuple[bool, str]:
+    """
+    Ganti akun userbot dengan nomor HP baru.
+
+    ── ALUR ────────────────────────────────────────────────────────────────
+    1. Hentikan userbot lama (jika aktif).
+    2. Hapus session lama dari disk dan DB.
+    3. Tulis USERBOT_PHONE baru ke variabel global dan file .env (jika ada).
+    4. Mulai OTP login flow untuk nomor baru — owner kirim /otp <kode> via DM.
+    5. Setelah login berhasil, simpan session baru dan aktifkan voice monitor.
+
+    Dipanggil dari handler UI secos_setuserbot_{chat_id} di handlers_secos.py.
+    Return: (berhasil: bool, pesan_hasil: str)
+    """
+    global userbot, _ub_ready, _ub_self_id, USERBOT_PHONE
+
+    # ── 1. Validasi format nomor ─────────────────────────────────────────
+    clean_phone = new_phone.strip()
+    if not _re.match(r"^\+\d{7,15}$", clean_phone):
+        return False, (
+            "Format nomor tidak valid. Gunakan format internasional, "
+            "contoh: <code>+628123456789</code>"
+        )
+
+    # ── 2. Hentikan userbot lama ─────────────────────────────────────────
+    _ub_ready = False
+    if userbot:
+        try:
+            await userbot.stop()
+        except Exception:
+            pass
+        userbot = None
+    _ub_self_id = 0
+
+    # Hapus session lama dari disk
+    session_file = _UB_SESSION + ".session"
+    try:
+        _Path(session_file).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    # Hapus session lama dari DB
+    try:
+        db, _, _ = _get_db()
+        await db["userbot_session"].delete_many({})
+    except Exception:
+        pass
+
+    # ── 3. Set nomor baru ────────────────────────────────────────────────
+    USERBOT_PHONE = clean_phone
+
+    # Perbarui .env jika file ada (best-effort)
+    env_path = _Path(__file__).parent / ".env"
+    if env_path.exists():
+        try:
+            env_text = env_path.read_text()
+            import re as _re2
+            if _re2.search(r"^USERBOT_PHONE\s*=", env_text, _re2.MULTILINE):
+                env_text = _re2.sub(
+                    r"^(USERBOT_PHONE\s*=).*$",
+                    rf"\g<1>{clean_phone}",
+                    env_text,
+                    flags=_re2.MULTILINE,
+                )
+            else:
+                env_text += f"\nUSERBOT_PHONE={clean_phone}\n"
+            env_path.write_text(env_text)
+        except Exception as e:
+            print(f"[UB-Change] Gagal update .env: {e} (tidak fatal)")
+
+    # ── 4. Login dengan nomor baru ───────────────────────────────────────
+    print(f"[UB-Change] 🔄 Ganti userbot → nomor baru: {clean_phone}")
+    result = await _do_login(bot)
+
+    if isinstance(result, tuple):
+        ok, self_id = result
+    else:
+        ok, self_id = result, 0
+
+    if not ok or not userbot:
+        return False, (
+            "Login userbot baru gagal. Pastikan nomor benar dan OTP dikirim "
+            "via DM bot dengan format <code>/otp &lt;kode&gt;</code>."
+        )
+
+    # ── 5. Aktifkan ──────────────────────────────────────────────────────
+    _ub_self_id = self_id
+    _ub_ready   = True
+    try:
+        me = await userbot.get_me()
+        uname = me.username or me.first_name or str(me.id)
+    except Exception:
+        uname = "userbot baru"
+
+    await _log_registered_groups()
+    asyncio.create_task(_voice_chat_monitor_loop())
+
+    print(f"[UB-Change] ✅ Userbot berhasil diganti → @{uname} (id={self_id})")
+    return True, (
+        f"✅ Userbot berhasil diganti ke <b>@{uname}</b> (id: <code>{self_id}</code>).\n"
+        f"Voice chat monitor sudah aktif kembali."
+    )
+
+
+async def setup_monitor_bot(
+    chat_id: int,
+    token: str,
+    inviter_bot: _Client,
+) -> tuple[bool, str]:
+    """
+    Validasi token bot pemantau dan simpan ke DB.
+    Bot pemantau TIDAK langsung di-join ke grup — admin menambahkannya manual.
+    Saat bot pemantau masuk ke grup, handler on_chat_member_updated akan
+    mengenalinya otomatis dari DB.
+
+    Jika grup ini sudah punya bot pemantau LAMA (token berbeda),
+    bot lama di-kick dulu dari grup sebelum yang baru disimpan.
+
+    Return: (berhasil: bool, pesan_hasil: str)
+    """
+    import httpx
+
+    db, _, _ = _get_db()
+
+    # ── 1. Validasi token via Telegram getMe ─────────────────────────────────
+    try:
+        async with httpx.AsyncClient(timeout=10) as hc:
+            resp = await hc.get(f"https://api.telegram.org/bot{token}/getMe")
+            data = resp.json()
+        if not data.get("ok"):
+            desc = data.get("description", "unknown error")
+            return False, f"Token tidak valid: {desc}"
+        info           = data["result"]
+        monitor_bot_id = int(info["id"])
+        monitor_uname  = info.get("username", str(monitor_bot_id))
+    except Exception as e:
+        return False, f"Gagal menghubungi Telegram API: {e}"
+
+    # ── 2. Pastikan bot pemantau belum dipakai grup lain ─────────────────────
+    mon_col  = db["security_os_monitors"]
+    existing = await mon_col.find_one({"monitor_bot_id": monitor_bot_id})
+    if existing:
+        existing_chat = int(existing.get("chat_id", 0))
+        if existing_chat != chat_id:
+            return False, (
+                f"Bot @{monitor_uname} sudah terdaftar di grup lain "
+                f"(<code>{existing_chat}</code>).\n"
+                f"1 bot pemantau hanya boleh digunakan di 1 grup."
+            )
+        # Bot pemantau sudah terdaftar di grup ini — update saja (token baru)
+
+    # ── 2b. Kick bot pemantau LAMA jika token berbeda ────────────────────────
+    old_doc    = await _sec_os_get(chat_id)
+    old_mon_id = old_doc.get("monitor_bot_id", 0)
+    if old_mon_id and old_mon_id != monitor_bot_id:
+        old_uname = _monitor_username_cache.get(old_mon_id, f"id:{old_mon_id}")
+        try:
+            await inviter_bot.ban_chat_member(chat_id, old_mon_id)
+            await asyncio.sleep(1)
+            await inviter_bot.unban_chat_member(chat_id, old_mon_id)
+            print(f"[SecOS] Bot lama @{old_uname} ({old_mon_id}) di-kick dari grup {chat_id}")
+        except Exception as e_kick:
+            print(f"[SecOS] Kick bot lama gagal (mungkin sudah tidak ada): {e_kick}")
+        # Hapus entri lama dari monitor index
+        await mon_col.delete_one({"monitor_bot_id": old_mon_id})
+        _monitor_username_cache.pop(old_mon_id, None)
+
+    # ── 3. Simpan ke DB — bot pemantau dikonfigurasi, belum harus join ───────
+    await _sec_os_set_monitor(chat_id, token, monitor_bot_id)
+
+    # Index global: 1 bot pemantau → 1 grup
+    await mon_col.update_one(
+        {"monitor_bot_id": monitor_bot_id},
+        {"$set": {"monitor_bot_id": monitor_bot_id, "chat_id": chat_id}},
+        upsert=True,
+    )
+
+    # Cache username
+    _monitor_username_cache[monitor_bot_id] = monitor_uname
+
+    print(f"[SecOS] Bot pemantau @{monitor_uname} ({monitor_bot_id}) dikonfigurasi untuk grup {chat_id}")
+    print(f"[SecOS] Menunggu @{monitor_uname} ditambahkan ke grup secara manual...")
+
+    # ── Langsung spawn instance bot pemantau baru ─────────────────────────────
+    # Instance ini akan mulai scan berkala setelah bot pemantau join ke grup.
+    # Tidak perlu restart proses — instance jalan dalam proses yang sama.
+    try:
+        from monitor_bot_reference import spawn_monitor_for_group
+        asyncio.create_task(
+            spawn_monitor_for_group(chat_id, token, monitor_bot_id)
+        )
+        print(f"[SecOS] MonitorInstance untuk grup {chat_id} di-spawn.")
+    except Exception as e_spawn:
+        print(f"[SecOS] Gagal spawn MonitorInstance: {e_spawn}")
+        # Tidak fatal — instance akan di-load ulang saat restart proses
+
+    return True, (
+        f"Bot @{monitor_uname} berhasil dikonfigurasi.\n"
+        f"Sekarang tambahkan <b>@{monitor_uname}</b> ke grup secara manual,\n"
+        f"dan bot akan dikenali otomatis saat masuk."
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PUBLIC API — fungsi yang dipanggil dari luar modul ini
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def security_os_enable(chat_id: int) -> None:
+    """
+    Aktifkan Security OS untuk grup ini (per-grup, tidak mempengaruhi grup lain).
+
+    Urutan yang benar:
+      1. Simpan enabled=True ke DB
+      2. Reset cache bio grup ini
+      3. Pastikan userbot member grup ini (tunggu selesai)
+      4. Baru join VC grup ini (jika ada VC aktif)
+      5. Spawn MonitorInstance untuk grup ini
+    """
+    await _sec_os_set_enabled(chat_id, True)
+
+    # Reset cache bio grup ini saja
+    keys_to_del = [k for k in _bio_cache if k[0] == chat_id]
+    for k in keys_to_del:
+        _bio_cache.pop(k, None)
+
+    if userbot and _ub_ready:
+        asyncio.create_task(_enable_secos_for_group(chat_id))
+
+
+async def _enable_secos_for_group(chat_id: int) -> None:
+    """
+    Task sequential per grup saat Security OS diaktifkan:
+    join VC dulu → pastikan monitor aktif (spawn hanya jika belum ada).
+    Userbot sudah admin grup — tidak perlu join_chat.
+    """
+    # Join VC grup ini (guard inside akan skip jika sudah di VC)
+    await _join_vc_for_group(chat_id)
+
+    # Spawn MonitorInstance hanya jika belum aktif
+    try:
+        from monitor_bot_reference import spawn_monitor_for_group, _active_instances
+        if chat_id in _active_instances:
+            print(f"[SecOS] Bot pemantau grup {chat_id} sudah aktif — skip spawn ulang.")
+            return
+        db, _, _ = _get_db()
+        sec_doc = await db["security_os"].find_one({"chat_id": chat_id}) or {}
+        token  = sec_doc.get("monitor_token", "").strip()
+        bot_id = sec_doc.get("monitor_bot_id", 0)
+        if token and bot_id:
+            await spawn_monitor_for_group(chat_id, token, bot_id)
+        else:
+            print(f"[SecOS] Grup {chat_id}: belum ada token monitor — bot pemantau belum dikonfigurasi.")
+    except Exception as _e_mon:
+        print(f"[SecOS] Gagal spawn MonitorInstance grup {chat_id}: {_e_mon}")
+
+
+async def security_os_disable(chat_id: int) -> None:
+    """
+    Nonaktifkan Security OS untuk grup ini.
+
+    Userbot dipaksa KELUAR dari obrolan suara agar tidak ada di VC
+    saat Security OS tidak aktif (persisten meski redeploy).
+
+    PENTING: bot pemantau (MonitorInstance) TIDAK dihentikan.
+    Bot pemantau wajib selalu hidup karena juga dipakai oleh bio.py,
+    terlepas dari status Security OS.
+    """
+    await _sec_os_set_enabled(chat_id, False)
+
+    # ── Paksa userbot turun dari VC via worker (antri — tidak langsung) ──────
+    if userbot and _ub_ready:
+        _enqueue_vc_leave(chat_id)
+
+    # ── Bot pemantau TIDAK dimatikan — selalu standby (bio.py juga memakainya)
+    print(f"[SecOS] Security OS dinonaktifkan grup {chat_id} — bot pemantau tetap aktif.")
+
+
+async def security_os_get_status(chat_id: int) -> dict:
+    """Ambil status Security OS untuk grup. Return dict dokumen DB."""
+    return await _sec_os_get(chat_id)
+
+
+def is_userbot_ready() -> bool:
+    """Return True jika userbot sudah login dan siap memantau."""
+    return _ub_ready and userbot is not None
+
+
+async def check_monitor_is_member(client: _Client, chat_id: int) -> bool:
+    """
+    Cek apakah bot pemantau sudah menjadi anggota (atau admin) di grup.
+
+    Menggunakan bot utama (client) untuk get_chat_member karena userbot mungkin
+    tidak selalu ada di grup target.
+
+    Return True jika bot pemantau sudah ada di grup, False jika belum.
+    """
+    sec_doc = await _sec_os_get(chat_id)
+    monitor_bot_id = sec_doc.get("monitor_bot_id", 0)
+    if not monitor_bot_id:
+        return False
+
+    # Force resolve peer dulu agar sesi bot utama kenal grup ini
+    try:
+        await client.get_chat(chat_id)
+    except Exception:
+        pass
+
+    try:
+        from pyrogram.enums import ChatMemberStatus
+        member = await client.get_chat_member(chat_id, monitor_bot_id)
+        return member.status in (
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
+        )
+    except (PeerIdInvalid, ValueError, KeyError):
+        # Peer belum dikenal sesi ini bahkan setelah get_chat — return False (safe)
+        print(f"[SecOS] check_monitor_is_member: peer {chat_id} belum dikenal sesi bot — anggap belum join.")
+        return False
+    except Exception as e:
+        # USER_NOT_PARTICIPANT atau error lain → belum jadi anggota
+        print(f"[SecOS] check_monitor_is_member error chat={chat_id}: {e}")
+        return False
+
+
+async def check_activation_prerequisites(
+    client: _Client,
+    chat_id: int,
+) -> tuple[bool, list[str]]:
+    """
+    Periksa syarat wajib sebelum Security OS boleh diaktifkan.
+
+    Syarat WAJIB (memblokir aktivasi):
+      1. Userbot sudah online
+      2. Bot pemantau sudah dikonfigurasi di DB
+
+    Syarat OPSIONAL (warning saja, tidak memblokir):
+      3. Bot pemantau sudah jadi anggota grup
+         (bisa diaktifkan dulu, bot dikenali otomatis saat masuk)
+
+    Return: (syarat_wajib_terpenuhi: bool, daftar_pesan: list[str])
+    """
+    blockers: list[str] = []
+    warnings: list[str] = []
+
+    # ── Syarat wajib 1: userbot online ───────────────────────────────────────
+    if not is_userbot_ready():
+        blockers.append(
+            "⚠️ <b>Userbot belum online.</b>\n"
+            "└ Pastikan <code>USERBOT_PHONE</code> sudah diisi di <code>.env</code> "
+            "dan bot sudah di-restart. Kemudian kirim OTP yang dikirim Telegram ke HP Anda."
+        )
+
+    # ── Syarat wajib 2: bot pemantau sudah dikonfigurasi di DB ───────────────
+    sec_doc = await _sec_os_get(chat_id)
+    has_monitor_config = bool(sec_doc.get("monitor_bot_id", 0))
+
+    if not has_monitor_config:
+        blockers.append(
+            "🤖 <b>Bot pemantau belum dikonfigurasi.</b>\n"
+            "└ Buat bot baru via @BotFather, salin tokennya, lalu tekan "
+            "<b>🤖 Pasang Bot Pemantau</b> dan masukkan token tersebut.\n"
+            "   Setelah token disimpan, tambahkan bot pemantau ke grup secara manual."
+        )
+    else:
+        # ── Warning opsional: bot pemantau belum join grup ───────────────────
+        is_member = await check_monitor_is_member(client, chat_id)
+        if not is_member:
+            monitor_bot_id = sec_doc.get("monitor_bot_id", 0)
+            uname = _monitor_username_cache.get(monitor_bot_id, f"id:{monitor_bot_id}")
+            warnings.append(
+                f"ℹ️ <b>Bot pemantau @{uname} belum ada di grup.</b>\n"
+                f"└ Tambahkan ke grup agar fitur checkbio berfungsi.\n"
+                f"   Bot akan dikenali otomatis saat masuk.\n"
+                f"   <i>(Security OS tetap bisa diaktifkan sekarang.)</i>"
+            )
+
+    all_ok = len(blockers) == 0
+    # Blockers dulu, lalu warnings — caller menampilkan semuanya
+    return all_ok, blockers + warnings
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AUTO-KENALI BOT PEMANTAU SAAT DITAMBAHKAN KE GRUP
+# Saat bot pemantau masuk ke grup, cocokkan dengan DB → log konfirmasi.
+# group=10 — jalan setelah handler nexus (8, 9) tapi tidak mengganggu mereka.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def register_monitor_join_handler(bot: _Client) -> None:
+    """
+    Pasang handler on_chat_member_updated di bot utama untuk mendeteksi
+    bot pemantau yang baru ditambahkan ke grup.
+    Dipanggil dari start_userbot() setelah bot biasa aktif.
+    """
+
+    @bot.on_chat_member_updated(group=10)
+    async def _on_monitor_joined(client: _Client, update: _ChatMemberUpdated):
+        try:
+            from pyrogram.enums import ChatMemberStatus
+
+            new = update.new_chat_member
+            if not new or not new.user or not new.user.is_bot:
+                return  # bukan bot → skip
+
+            # Hanya tangkap event JOIN (bukan kick/ban/promote)
+            if new.status not in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR):
+                return
+
+            bot_id  = new.user.id
+            chat_id = update.chat.id
+
+            # Cek apakah bot ini adalah bot pemantau yang terdaftar untuk grup ini
+            sec_doc = await _sec_os_get(chat_id)
+            registered_monitor_id = sec_doc.get("monitor_bot_id", 0)
+
+            if not registered_monitor_id or registered_monitor_id != bot_id:
+                return  # bukan bot pemantau kita → skip
+
+            uname = new.user.username or str(bot_id)
+            _monitor_username_cache[bot_id] = uname
+
+            print(f"[SecOS] ✅ Bot pemantau @{uname} ({bot_id}) terdeteksi masuk grup {chat_id} — dikenali otomatis.")
+
+            # Jika Security OS sudah enabled, tidak perlu lakukan apa-apa lagi
+            # Jika belum enabled, beri tahu di console saja
+            if not sec_doc.get("enabled", False):
+                print(f"[SecOS] ℹ️  Security OS grup {chat_id} belum diaktifkan. Aktifkan via panel.")
+
+        except Exception as e:
+            print(f"[SecOS] _on_monitor_joined error: {e}")
