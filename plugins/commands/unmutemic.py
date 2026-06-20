@@ -145,12 +145,13 @@ async def cmd_unmutemic(client: Client, message: Message):
 
     # ── Member biasa: cek bio via bot pemantau (fresh) ──────────────────────
     has_link, monitor_unavailable = await _query_bio_from_db(cid, uid)
-
     if has_link is True:
+        print(f"[UnmuteMic] uid={uid} grup={cid}: bio masih ada link → abaikan.")
+        _unmutemic_cooldown.pop((cid, uid), None)   # ← kembalikan ke 0, tidak dihitung
+        return
+        # cooldown masih bingung nunggu pemecahan masalah nanti
         # Kondisi A (spek): masih terdeteksi link di bio → abaikan perintah,
         # userbot tidak perlu join VC grup ini.
-        print(f"[UnmuteMic] uid={uid} grup={cid}: bio masih ada link → abaikan.")
-        return
 
     if has_link is None and not monitor_unavailable:
         # Golongan 1: user TIDAK DIKENALI SAMA SEKALI oleh bot pemantau
