@@ -533,6 +533,9 @@ def _get_warn_queue(chat_id: int) -> asyncio.Queue:
         _warn_queues[chat_id] = asyncio.Queue()
     return _warn_queues[chat_id]
 
+# Set chat_id yang sedang di-fetch admin list-nya — cegah concurrent fetch
+_admin_fetch_in_progress: set[int] = set()
+
 async def _get_group_admin_ids(chat_id: int) -> set[int]:
     """
     Ambil set user_id admin grup, dengan cache 5 menit.
@@ -546,6 +549,10 @@ async def _get_group_admin_ids(chat_id: int) -> set[int]:
             return ids
     if not userbot:
         return set()
+    # Guard: jika sudah ada fetch in-progress untuk grup ini, pakai cache lama
+    if chat_id in _admin_fetch_in_progress:
+        return _admin_cache.get(chat_id, (set(), 0.0))[0]
+    _admin_fetch_in_progress.add(chat_id)
     try:
         from pyrogram.enums import ChatMembersFilter
         admin_ids: set[int] = set()
@@ -561,6 +568,8 @@ async def _get_group_admin_ids(chat_id: int) -> set[int]:
     except Exception as e:
         print(f"[UB-VC] Gagal ambil admin grup {chat_id}: {e}")
         return _admin_cache.get(chat_id, (set(), 0.0))[0]
+    finally:
+        _admin_fetch_in_progress.discard(chat_id)
 
 
 async def _warn_worker(chat_id: int) -> None:
@@ -578,8 +587,13 @@ async def _warn_worker(chat_id: int) -> None:
             await _do_send_warning(chat_id, user_id)
         except FloodWait as fw:
             wait_sec = fw.value + 2
-            print(f"[UB-Warn] FloodWait {fw.value}s di warn worker grup={chat_id} uid={user_id} — menunggu {wait_sec}s...")
+            print(f"[UB-Warn] FloodWait {fw.value}s di warn worker grup={chat_id} uid={user_id} — menunggu {wait_sec}s lalu retry...")
             await asyncio.sleep(wait_sec)
+            # Retry sekali setelah FloodWait — jangan buang item
+            try:
+                await _do_send_warning(chat_id, user_id)
+            except Exception as e_retry:
+                print(f"[UB-Warn] Retry warn gagal uid={user_id} grup={chat_id}: {e_retry}")
         except Exception as e:
             print(f"[UB-Warn] Worker error uid={user_id} grup={chat_id}: {e}")
         q.task_done()
@@ -2261,15 +2275,19 @@ def _secos_schedule_followup(chat_id: int, muted_users: list[tuple[int, str]]) -
     existing = _secos_followup_tasks.get(chat_id)
     if existing and not existing.done():
         # Sudah ada follow-up berjalan — spawn task terpisah untuk batch baru
-        # agar tidak kehilangan user yang di-mute belakangan
+        # agar tidak kehilangan user yang di-mute belakangan.
+        # Simpan ke dict dengan key turunan agar cache_cleanup bisa membersihkannya.
         print(
             f"[SecOS-FollowUp] Grup {chat_id}: sudah ada follow-up berjalan, "
             f"spawn task tambahan untuk {[u for u, _ in muted_users]}."
         )
-        _safe_task(
+        extra_key = f"{chat_id}_extra"
+        extra_task = _safe_task(
             _secos_followup_recheck(chat_id, muted_users),
             tag=f"secos-followup-extra-{chat_id}",
         )
+        # Overwrite slot extra — hanya butuh satu extra task per grup sekaligus
+        _secos_followup_tasks[extra_key] = extra_task  # type: ignore[assignment]
         return
 
     task = _safe_task(
@@ -2506,10 +2524,11 @@ async def _cache_cleanup_loop() -> None:
             print(f"[UB-Cache] ⚠️ _vc_join_pending: {len(_vc_join_pending)} entri — reset.")
             _vc_join_pending.clear()
 
-        # Processing kick safety: log jika terlalu besar (bisa ada yang stuck)
+        # Processing kick safety: clear entri yang stuck (guard > 30 entri)
         stuck_count = len(_processing_kick)
         if stuck_count > 30:
-            print(f"[UB-Cache] ⚠️ _processing_kick: {stuck_count} entri — mungkin ada yang stuck")
+            print(f"[UB-Cache] ⚠️ _processing_kick: {stuck_count} entri stuck — force clear untuk cegah blokir permanen.")
+            _processing_kick.clear()
 
         total = (
             len(_bio_cache) + len(_member_cache) + len(_vip_cache) +
@@ -3129,7 +3148,13 @@ async def _enable_secos_for_group(chat_id: int) -> None:
         token  = sec_doc.get("monitor_token", "").strip()
         bot_id = sec_doc.get("monitor_bot_id", 0)
         if token and bot_id:
-            await spawn_monitor_for_group(chat_id, token, bot_id)
+            try:
+                await asyncio.wait_for(
+                    spawn_monitor_for_group(chat_id, token, bot_id),
+                    timeout=30.0,
+                )
+            except asyncio.TimeoutError:
+                print(f"[SecOS] Timeout 30s spawn MonitorInstance grup {chat_id} — akan di-load saat restart.")
         else:
             print(f"[SecOS] Grup {chat_id}: belum ada token monitor — bot pemantau belum dikonfigurasi.")
     except Exception as _e_mon:
