@@ -641,6 +641,12 @@ def _get_db():
     return db, save_bot_config, get_bot_config
 
 
+# ── Cache untuk _sec_os_get (mempercepat panel DM — tidak query DB tiap klik) ─
+import time as _time_mod
+_sec_os_cache: dict[int, tuple[dict, float]] = {}
+_SEC_OS_TTL = 30  # detik
+
+
 async def _sec_os_get(chat_id: int) -> dict:
     """
     Ambil dokumen Security OS untuk satu grup dari DB.
@@ -652,6 +658,10 @@ async def _sec_os_get(chat_id: int) -> dict:
       monitor_bot_id : int   — user_id Telegram bot pemantau
       monitor_chat   : int   — chat_id grup (sama dengan chat_id, redundan tapi eksplisit)
     """
+    now = _time_mod.monotonic()
+    hit = _sec_os_cache.get(chat_id)
+    if hit and (now - hit[1]) < _SEC_OS_TTL:
+        return hit[0]
     db, _, _ = _get_db()
     doc = await db["security_os"].find_one({"chat_id": chat_id})
     if doc is None:
@@ -662,6 +672,7 @@ async def _sec_os_get(chat_id: int) -> dict:
             "monitor_bot_id": 0,
             "monitor_chat":   chat_id,
         }
+    _sec_os_cache[chat_id] = (doc, now)
     return doc
 
 
@@ -674,6 +685,7 @@ async def _sec_os_save(doc: dict) -> None:
         {"$set": payload},
         upsert=True,
     )
+    _sec_os_cache.pop(doc["chat_id"], None)  # invalidasi cache panel
 
 
 async def _sec_os_set_enabled(chat_id: int, enabled: bool) -> None:

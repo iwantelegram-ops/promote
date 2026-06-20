@@ -91,6 +91,23 @@ _admin_cache:  dict[tuple, tuple[bool, float]] = {}
 CONFIG_TTL = 10
 ADMIN_TTL  = 120
 
+# ── Panel UI cache (mempercepat tombol DM panel agar tidak query DB tiap klik) ─
+_ns_config_cache:   dict[int, tuple[dict, float]]  = {}  # ns_get_config
+_regex_count_cache: dict[int, tuple[int,  float]]  = {}  # count regex per grup
+_free_count_cache:  dict[int, tuple[int,  float]]  = {}  # count VIP per grup
+_admin_groups_cache: dict[int, tuple[list, float]] = {}  # get_my_admin_groups per user
+NS_CONFIG_TTL    = 30   # detik — ns_config jarang berubah
+COUNT_TTL        = 30   # detik — count regex/VIP
+ADMIN_GROUPS_TTL = 120  # detik — daftar grup admin (2 menit)
+
+# ── Nexus AI panel cache ───────────────────────────────────────────────────────
+_nexus_kalimat_count_cache: tuple[tuple[int,int], float] | None = None
+_nexus_regex_count_cache:   tuple[int, float]            | None = None
+_nexus_wl_count_cache:      tuple[int, float]            | None = None
+_nexus_owner_regex_count_cache: tuple[int, float]        | None = None
+_nexus_grup_cache:          tuple[list, float]           | None = None
+NEXUS_COUNT_TTL = 30   # detik
+
 # ── Delete queue ───────────────────────────────────────────────────────────────
 delete_queue: asyncio.Queue = asyncio.Queue()
 
@@ -1277,6 +1294,51 @@ async def update_config(chat_id: int, key: str, value) -> None:
     _config_cache.pop(chat_id, None)
 
 
+# ── Cached count helpers (dipakai oleh page_manage di panel DM) ───────────────
+
+async def get_regex_count(chat_id: int) -> int:
+    """Count regex rules untuk grup, dengan cache COUNT_TTL detik."""
+    now = time.monotonic()
+    hit = _regex_count_cache.get(chat_id)
+    if hit and (now - hit[1]) < COUNT_TTL:
+        return hit[0]
+    n = await db["regex_per_group"].count_documents({"chat_id": chat_id})
+    _regex_count_cache[chat_id] = (n, now)
+    return n
+
+
+async def get_free_count(chat_id: int) -> int:
+    """Count VIP members untuk grup, dengan cache COUNT_TTL detik."""
+    now = time.monotonic()
+    hit = _free_count_cache.get(chat_id)
+    if hit and (now - hit[1]) < COUNT_TTL:
+        return hit[0]
+    n = await db["free_per_group"].count_documents({"chat_id": chat_id})
+    _free_count_cache[chat_id] = (n, now)
+    return n
+
+
+def invalidate_count_cache(chat_id: int) -> None:
+    """Hapus cache count untuk grup ini (panggil saat regex/VIP ditambah/hapus)."""
+    _regex_count_cache.pop(chat_id, None)
+    _free_count_cache.pop(chat_id, None)
+
+
+def invalidate_admin_groups_cache(user_id: int) -> None:
+    """Paksa refresh daftar grup admin (panggil saat tombol Refresh ditekan)."""
+    _admin_groups_cache.pop(user_id, None)
+
+
+def invalidate_nexus_counts() -> None:
+    """Hapus semua cache count nexus — panggil setelah operasi tulis ke nexus collections."""
+    global _nexus_kalimat_count_cache, _nexus_regex_count_cache
+    global _nexus_wl_count_cache, _nexus_owner_regex_count_cache, _nexus_grup_cache
+    _nexus_kalimat_count_cache      = None
+    _nexus_regex_count_cache        = None
+    _nexus_wl_count_cache           = None
+    _nexus_owner_regex_count_cache  = None
+    _nexus_grup_cache               = None
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ADMIN CACHE
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1377,7 +1439,14 @@ async def get_my_admin_groups(client, user_id: int) -> list:
     sehingga dua bot dengan CODE_BOT yang sama melihat daftar grup yang sama.
 
     FIX: simpan chat_type saat bisa akses → filter channel saat tidak bisa akses.
+    CACHE: hasil di-cache ADMIN_GROUPS_TTL detik — hindari looping Telegram API
+           tiap kali admin menekan "Refresh" atau membuka daftar grup.
     """
+    now = time.monotonic()
+    hit = _admin_groups_cache.get(user_id)
+    if hit and (now - hit[1]) < ADMIN_GROUPS_TTL:
+        return hit[0]
+
     from pyrogram.enums import ChatType
     result = []
     async for doc in config_db.find({}):
@@ -1439,6 +1508,7 @@ async def get_my_admin_groups(client, user_id: int) -> list:
             # Bot tidak bisa akses sekarang — tetap verifikasi apakah user adalah admin
             if await is_admin(client, chat_id, user_id):
                 result.append({"id": chat_id, "title": title})
+    _admin_groups_cache[user_id] = (result, time.monotonic())
     return result
 
 
@@ -1500,17 +1570,25 @@ async def nexus_get_all_kalimat() -> list[str]:
 
 
 async def nexus_get_kalimat_count() -> tuple[int, int]:
+    global _nexus_kalimat_count_cache
+    now = time.monotonic()
+    if _nexus_kalimat_count_cache and (now - _nexus_kalimat_count_cache[1]) < NEXUS_COUNT_TTL:
+        return _nexus_kalimat_count_cache[0]
     total   = await nexus_kalimat_db.count_documents({})
     antrean = await nexus_kalimat_db.count_documents({"status_proses": 0})
+    _nexus_kalimat_count_cache = ((total, antrean), now)
     return total, antrean
 
 
 async def nexus_mark_all_processed():
     await nexus_kalimat_db.update_many({}, {"$set": {"status_proses": 1}})
+    invalidate_nexus_counts()
 
 
 async def nexus_delete_kalimat(teks: str) -> bool:
     result = await nexus_kalimat_db.delete_one({"teks": teks})
+    if result.deleted_count > 0:
+        invalidate_nexus_counts()
     return result.deleted_count > 0
 
 
@@ -1521,6 +1599,8 @@ async def nexus_delete_kalimat_by_id(id_str: str) -> bool:
             result = await nexus_kalimat_db.delete_one({"_id": ObjectId(id_str)})
         else:
             result = await nexus_kalimat_db.delete_one({"_id": str(id_str)})
+        if result.deleted_count > 0:
+            invalidate_nexus_counts()
         return result.deleted_count > 0
     except Exception:
         return False
@@ -1538,6 +1618,7 @@ async def nexus_save_regex_bulk(pola_list: list[tuple[str, str]]):
             for p, k in pola_list
         ]
         await nexus_regex_db.insert_many(docs)
+    invalidate_nexus_counts()
 
 
 async def nexus_get_all_regex() -> list[dict]:
@@ -1548,7 +1629,13 @@ async def nexus_get_all_regex() -> list[dict]:
 
 
 async def nexus_get_regex_count() -> int:
-    return await nexus_regex_db.count_documents({})
+    global _nexus_regex_count_cache
+    now = time.monotonic()
+    if _nexus_regex_count_cache and (now - _nexus_regex_count_cache[1]) < NEXUS_COUNT_TTL:
+        return _nexus_regex_count_cache[0]
+    n = await nexus_regex_db.count_documents({})
+    _nexus_regex_count_cache = (n, now)
+    return n
 
 
 async def nexus_delete_regex_by_pola(pola: str) -> bool:
@@ -1593,19 +1680,27 @@ async def nexus_remove_grup(chat_id: int):
 
 
 async def nexus_get_all_grup() -> list[dict]:
-    return [
+    global _nexus_grup_cache
+    now = time.monotonic()
+    if _nexus_grup_cache and (now - _nexus_grup_cache[1]) < NEXUS_COUNT_TTL:
+        return _nexus_grup_cache[0]
+    result = [
         {"chat_id": d["chat_id"], "judul": d.get("judul", str(d["chat_id"]))}
         async for d in nexus_grup_db.find({"is_group": True})
     ]
+    _nexus_grup_cache = (result, now)
+    return result
 
 
 async def nexus_clear_kalimat():
     await nexus_kalimat_db.delete_many({})
     await nexus_regex_db.delete_many({})
+    invalidate_nexus_counts()
 
 
 async def nexus_clear_regex():
     await nexus_regex_db.delete_many({})
+    invalidate_nexus_counts()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1627,6 +1722,7 @@ async def nexus_whitelist_add(pola: str, raw: str, kata_list: list, mutasi: dict
             },
             upsert=True,
         )
+        invalidate_nexus_counts()
         return True
     except Exception:
         return False
@@ -1637,7 +1733,24 @@ async def nexus_whitelist_get_all() -> list[dict]:
 
 
 async def nexus_whitelist_count() -> int:
-    return await nexus_whitelist_db.count_documents({})
+    global _nexus_wl_count_cache
+    now = time.monotonic()
+    if _nexus_wl_count_cache and (now - _nexus_wl_count_cache[1]) < NEXUS_COUNT_TTL:
+        return _nexus_wl_count_cache[0]
+    n = await nexus_whitelist_db.count_documents({})
+    _nexus_wl_count_cache = (n, now)
+    return n
+
+
+async def get_owner_regex_count() -> int:
+    """Count Owner Regex (regex_db) dengan cache NEXUS_COUNT_TTL detik."""
+    global _nexus_owner_regex_count_cache
+    now = time.monotonic()
+    if _nexus_owner_regex_count_cache and (now - _nexus_owner_regex_count_cache[1]) < NEXUS_COUNT_TTL:
+        return _nexus_owner_regex_count_cache[0]
+    n = await regex_db.count_documents({})
+    _nexus_owner_regex_count_cache = (n, now)
+    return n
 
 
 async def nexus_regex_delete_by_id(object_id) -> bool:
@@ -1648,6 +1761,8 @@ async def nexus_regex_delete_by_id(object_id) -> bool:
             result = await regex_db.delete_one({"_id": ObjectId(str(object_id))})
         else:
             result = await regex_db.delete_one({"_id": str(object_id)})
+        if result.deleted_count > 0:
+            invalidate_nexus_counts()
         return result.deleted_count > 0
     except Exception:
         return False
@@ -1660,6 +1775,8 @@ async def nexus_whitelist_delete_by_id(object_id) -> bool:
             result = await nexus_whitelist_db.delete_one({"_id": ObjectId(str(object_id))})
         else:
             result = await nexus_whitelist_db.delete_one({"_id": str(object_id)})
+        if result.deleted_count > 0:
+            invalidate_nexus_counts()
         return result.deleted_count > 0
     except Exception:
         return False
@@ -1677,6 +1794,7 @@ async def nexus_whitelist_page(page: int, limit: int = 5) -> tuple[list[dict], i
 
 async def nexus_whitelist_clear() -> int:
     result = await nexus_whitelist_db.delete_many({})
+    invalidate_nexus_counts()
     return result.deleted_count
 
 
@@ -2100,6 +2218,10 @@ HARI_MAP_NS = {0: "Senin", 1: "Selasa", 2: "Rabu", 3: "Kamis",
 
 
 async def ns_get_config(chat_id: int) -> dict:
+    now = time.monotonic()
+    hit = _ns_config_cache.get(chat_id)
+    if hit and (now - hit[1]) < NS_CONFIG_TTL:
+        return hit[0]
     doc = await newscore_cfg_db.find_one({"chat_id": chat_id})
     cfg = {k: v for k, v in NEWSCORE_DEFAULT.items()}
     cfg["privileges"] = dict(NEWSCORE_DEFAULT["privileges"])
@@ -2109,6 +2231,7 @@ async def ns_get_config(chat_id: int) -> dict:
                 cfg[k] = doc[k]
         if "privileges" in doc:
             cfg["privileges"] = dict(doc["privileges"])
+    _ns_config_cache[chat_id] = (cfg, now)
     return cfg
 
 
@@ -2118,6 +2241,7 @@ async def ns_update(chat_id: int, updates: dict) -> None:
         {"$set": {"chat_id": chat_id, **updates}},
         upsert=True,
     )
+    _ns_config_cache.pop(chat_id, None)  # invalidasi cache panel
 
 
 def ns_calc_next_reset(cfg: dict) -> str:
