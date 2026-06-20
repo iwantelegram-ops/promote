@@ -16,7 +16,7 @@ FIXED: page_group_log sekarang return HTML murni (bukan marker [BQ]) sehingga
 import os
 from datetime import datetime, timezone
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from database import get_config, db, get_group_action_log_page, TZ_WIB as _TZ_WIB, get_bot_config
+from database import get_config, db, get_group_action_log_page, TZ_WIB as _TZ_WIB, get_bot_config, get_regex_count, get_free_count, invalidate_count_cache
 from video_call import security_os_get_status, is_userbot_ready
 
 _OWNER_ID        = int(os.environ.get("OWNER_ID", 0))
@@ -418,8 +418,8 @@ async def page_manage(chat_id: int):
     def icon(key): return "✅" if cfg[key] else "❌"
 
     waktu       = cfg["expiry"] // 60
-    regex_count = await group_regex_db.count_documents({"chat_id": chat_id})
-    free_count  = await free_col.count_documents({"chat_id": chat_id})
+    regex_count = await get_regex_count(chat_id)
+    free_count  = await get_free_count(chat_id)
 
     # Ambil status Security OS
     sec_doc    = await security_os_get_status(chat_id)
@@ -532,7 +532,7 @@ async def page_regex_list(chat_id: int, page: int = 1):
 
     LIMIT  = 5
     offset = (page - 1) * LIMIT
-    total  = await group_regex_db.count_documents({"chat_id": chat_id})
+    total  = await get_regex_count(chat_id)
     docs   = [doc async for doc in group_regex_db.find({"chat_id": chat_id}).sort("_id", -1).skip(offset).limit(LIMIT)]
     total_pages = max(1, (total + LIMIT - 1) // LIMIT)
 

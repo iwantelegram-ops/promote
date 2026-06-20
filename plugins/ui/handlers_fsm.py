@@ -22,7 +22,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from pyrogram.enums import ParseMode
 from pyrogram.errors import MessageNotModified, MessageIdInvalid
 
-from database import db
+from database import db, invalidate_count_cache
 from plugins.ui.pages import (
     page_regex_list, page_regex_tutorial,
     page_whitelist_text, page_free_list,
@@ -152,6 +152,7 @@ async def _handle_regex_input(client, message: Message, user_id: int, state: dic
         invalidate_local_regex_cache(chat_id)
     except Exception:
         pass
+    invalidate_count_cache(chat_id)  # refresh jumlah filter di panel
 
     text, keyboard = await page_regex_list(chat_id, 1)
     kata_str = " + ".join(f"<code>{k}</code>" for k in kata_list) if kata_list else f"<code>{raw}</code>"
@@ -194,6 +195,7 @@ async def _handle_free_input(client, message: Message, user_id: int, state: dict
         invalidate_vip_cache(chat_id, target_id)
     except ImportError:
         pass
+    invalidate_count_cache(chat_id)  # refresh jumlah VIP di panel
 
     text, keyboard = await page_free_list(chat_id)
     header = (

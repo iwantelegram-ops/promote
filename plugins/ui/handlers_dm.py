@@ -24,7 +24,7 @@ from pyrogram.raw.types import (
     MessageEntityBold       as _RawBold,
 )
 
-from database import get_config, update_config
+from database import get_config, update_config, invalidate_count_cache, invalidate_admin_groups_cache
 from plugins.ui.pages import (
     page_start, page_guide, page_manage, page_group_log,
     page_regex_tutorial, page_regex_list,
@@ -165,9 +165,14 @@ async def cb_guide(client, cb: CallbackQuery):
     await safe_edit(cb.message, text, keyboard)
 
 
-@Client.on_callback_query(filters.regex(r"^admin_menu$"))
+@Client.on_callback_query(filters.regex(r"^admin_menu(_refresh)?$"))
 async def cb_admin_menu(client, cb: CallbackQuery):
-    await cb.answer("⏳ Menghubungkan ke database grup...")
+    is_refresh = cb.data == "admin_menu_refresh"
+    if is_refresh:
+        invalidate_admin_groups_cache(cb.from_user.id)
+        await cb.answer("🔄 Menyinkronisasi ulang daftar grup...")
+    else:
+        await cb.answer("⏳ Menghubungkan ke database grup...")
     clear_all_fsm(cb.from_user.id)
     from database import get_my_admin_groups
     groups = await get_my_admin_groups(client, cb.from_user.id)
@@ -183,7 +188,7 @@ async def cb_admin_menu(client, cb: CallbackQuery):
             "3. Bot sudah diangkat menjadi Admin grup.\n\n"
             "<i>Selesaikan langkah di atas, lalu tekan Refresh.</i>",
             InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄  Refresh Sinkronisasi", callback_data="admin_menu")],
+                [InlineKeyboardButton("🔄  Refresh Sinkronisasi", callback_data="admin_menu_refresh")],
                 [InlineKeyboardButton("🔙  Kembali", callback_data="start")],
             ])
         )
@@ -193,7 +198,7 @@ async def cb_admin_menu(client, cb: CallbackQuery):
         [InlineKeyboardButton(f"📂 {g['title']}", callback_data=f"manage_{g['id']}")]
         for g in groups
     ]
-    buttons.append([InlineKeyboardButton("🔄  Refresh Sinkronisasi", callback_data="admin_menu")])
+    buttons.append([InlineKeyboardButton("🔄  Refresh Sinkronisasi", callback_data="admin_menu_refresh")])
     buttons.append([InlineKeyboardButton("🔙  Kembali ke Dasbor",    callback_data="start")])
 
     await safe_edit(
@@ -427,6 +432,7 @@ async def cb_regex_del(client, cb: CallbackQuery):
 
         from plugins.filters.antispam import invalidate_local_regex_cache
         invalidate_local_regex_cache(chat_id)
+        invalidate_count_cache(chat_id)  # refresh count di panel
 
         text, keyboard = await page_regex_list(chat_id, 1)
         await safe_edit(cb.message, text, keyboard)
@@ -535,6 +541,7 @@ async def cb_free_del(client, cb: CallbackQuery):
             invalidate_vip_cache(chat_id, target_user_id)
         except ImportError:
             pass
+        invalidate_count_cache(chat_id)  # refresh count di panel
 
         text, keyboard = await page_free_list(chat_id)
         await safe_edit(cb.message, text, keyboard)
