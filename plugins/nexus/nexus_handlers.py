@@ -58,6 +58,8 @@ from database import (
     nexus_actlog_count,
     nexus_actlog_clear,
     regex_db,
+    get_owner_regex_count,
+    invalidate_nexus_counts,
 )
 from plugins.nexus.engine import (
     pipeline_pembersihan,
@@ -91,7 +93,7 @@ _whitelist_fsm:   dict[int, int] = {}   # FSM untuk input whitelist regex
 async def _welcome_text() -> str:
     total, antrean = await nexus_get_kalimat_count()
     total_regex    = await nexus_get_regex_count()
-    owner_regex_ct = await regex_db.count_documents({})
+    owner_regex_ct = await get_owner_regex_count()
     wl_ct          = await nexus_whitelist_count()
     return (
         "🤖 **NEXUS AI ENGINE**\n"
@@ -402,6 +404,7 @@ async def nexus_direct_add_regex(client: Client, message: Message):
         }},
         upsert=True,
     )
+    invalidate_nexus_counts()
 
     hasil_respon = (
         f"✅ **DIRECT INJECTION SUCCESS!**\n"
@@ -618,6 +621,7 @@ async def nexus_owner_regex_fsm(client: Client, message: Message):
         }},
         upsert=True,
     )
+    invalidate_nexus_counts()
 
     header = f"✅ **`{raw_joined}`** Full Interlock berhasil dikunci ke Core Database!\n\n"
     await _render_owner_regex_page(client, message.chat.id, msg_id, 1, header=header)
@@ -630,7 +634,7 @@ async def nexus_owner_regex_fsm(client: Client, message: Message):
 async def _render_owner_regex_page(client, chat_id: int, msg_id: int, page: int, header: str = ""):
     limit  = 5
     offset = (page - 1) * limit
-    total  = await regex_db.count_documents({})
+    total  = await get_owner_regex_count()
     docs   = [doc async for doc in regex_db.find({}).sort("_id", -1).skip(offset).limit(limit)]
     total_pages = max(1, (total + limit - 1) // limit)
 
@@ -1111,7 +1115,7 @@ async def nexus_callback_router(client: Client, cq: CallbackQuery):
         except Exception:
             pass
         ai_ct    = await nexus_get_regex_count()
-        owner_ct = await regex_db.count_documents({})
+        owner_ct = await get_owner_regex_count()
         wl_ct    = await nexus_whitelist_count()
         await _safe_edit(
             cq.message,
